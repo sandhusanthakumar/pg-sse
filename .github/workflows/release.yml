@@ -1,0 +1,76 @@
+name: Release
+
+# Push a tag like v0.1.0 to publish to PyPI. Run the workflow by hand ("Run workflow") to publish to TestPyPI instead.
+# Both need a trusted publisher for this repository and workflow, and an environment of that name:
+#   PyPI (environment `pypi`): https://docs.pypi.org/trusted-publishers/
+#   TestPyPI (environment `testpypi`): the same, registered at https://test.pypi.org/manage/account/publishing/
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # A tag never publishes a commit the tests have not passed.
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: sse
+          POSTGRES_PASSWORD: sse
+          POSTGRES_DB: pg_sse_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U sse"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PG_SSE_TEST_DSN: postgresql://sse:sse@localhost:5432/pg_sse_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy
+      - run: uv run pytest --cov --cov-report=term-missing
+
+  publish:
+    if: github.event_name == 'push'
+    needs: test
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Tag matches the package version
+        run: test "${GITHUB_REF_NAME#v}" = "$(uv version --short)"
+      - run: uv build
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  testpypi:
+    if: github.event_name == 'workflow_dispatch'
+    needs: test
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv build
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true

@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14"]
+        postgres: ["18"]
+        resolution: [highest]
+        include:
+          # The oldest Postgres the triggers support, and the oldest dependencies the package claims.
+          - python: "3.11"
+            postgres: "14"
+            resolution: lowest-direct
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}
+        env:
+          POSTGRES_USER: sse
+          POSTGRES_PASSWORD: sse
+          POSTGRES_DB: pg_sse_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U sse"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PG_SSE_TEST_DSN: postgresql://sse:sse@localhost:5432/pg_sse_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      # The locked versions are what the lock file says; lowest-direct re-resolves by design, so it cannot be --locked.
+      - run: uv sync --locked
+        if: matrix.resolution == 'highest'
+      - run: uv sync --resolution lowest-direct
+        if: matrix.resolution == 'lowest-direct'
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy
+      - run: uv run pytest --cov --cov-report=term-missing
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv build
+      - run: uvx twine check dist/*
