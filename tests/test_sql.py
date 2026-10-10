@@ -112,6 +112,44 @@ def test_ids_follow_commit_order_within_a_key(db, id_column):
     assert second["id"] > other_id  # drawn after the wait, not when the statement began
 
 
+def test_the_order_trigger_does_not_look_up_the_sequence_on_every_insert(db):
+    make_table(db, order_column="id")
+    source = execute(
+        db.dsn,
+        "SELECT prosrc FROM pg_proc WHERE proname = 'pg_sse$order$messages$id' AND pronamespace = %s::regnamespace",
+        (db.schema,),
+    )[0][0]
+    assert "pg_get_serial_sequence" not in source
+    assert f"nextval('{db.schema}.messages_id_seq')" in source  # resolved once, at install, and schema-qualified
+    ids = [execute(db.dsn, "INSERT INTO messages (room) VALUES ('a') RETURNING id")[0][0] for _ in range(3)]
+    assert ids == sorted(ids)
+    assert len(set(ids)) == 3
+
+
+def test_the_sql_has_no_percent_sign_for_a_driver_to_read_as_a_placeholder():
+    assert "%" not in trigger_sql("messages", "room", "c", order_column="id", update_of=("body",))
+
+
+def test_running_the_sql_again_follows_a_renamed_sequence(db):
+    make_table(db, order_column="id")
+    execute(db.dsn, "ALTER SEQUENCE messages_id_seq RENAME TO messages_ids")
+    with pytest.raises(psycopg.errors.UndefinedTable):
+        execute(db.dsn, "INSERT INTO messages (room) VALUES ('a')")
+    execute(db.dsn, trigger_sql("messages", "room", db.channel, order_column="id"))
+    assert execute(db.dsn, "INSERT INTO messages (room) VALUES ('a') RETURNING id")
+
+
+def test_a_replaced_sequence_keeps_working_without_running_the_sql_again(db):
+    make_table(db, order_column="id")
+    execute(db.dsn, "INSERT INTO messages (room) VALUES ('a')")  # the function's plan is cached in this session
+    execute(db.dsn, "ALTER TABLE messages ALTER COLUMN id DROP DEFAULT")
+    execute(db.dsn, "DROP SEQUENCE messages_id_seq")
+    execute(db.dsn, "CREATE SEQUENCE messages_id_seq START 100 OWNED BY messages.id")
+    execute(db.dsn, "ALTER TABLE messages ALTER COLUMN id SET DEFAULT nextval('messages_id_seq')")
+    # The column default draws 100 and the order trigger replaces it with the next value.
+    assert execute(db.dsn, "INSERT INTO messages (room) VALUES ('a') RETURNING id") == [(101,)]
+
+
 def test_an_order_column_without_a_sequence_is_refused_at_install(db):
     execute(db.dsn, "CREATE TABLE messages (id bigint PRIMARY KEY, room text NOT NULL)")
     with pytest.raises(psycopg.errors.RaiseException, match="no sequence"):
@@ -168,3 +206,90 @@ def test_dropping_only_what_was_created_and_twice_is_harmless(db):
 def test_dropping_checks_the_names_too():
     with pytest.raises(ValueError, match="identifier"):
         drop_trigger_sql("Messages", "room")
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"on": ()}, "at least one"),
+        ({"on": ("insert", "upsert")}, "only"),
+        ({"on": ("INSERT",)}, "only"),
+        ({"on": "insert"}, "not the string"),
+        ({"update_of": ()}, "at least one column"),
+        ({"update_of": "body"}, "not the string"),
+        ({"update_of": ("Body",)}, "identifier"),
+        ({"update_of": ("body; drop",)}, "identifier"),
+        ({"on": ("insert", "delete"), "update_of": ("body",)}, "include 'update'"),
+    ],
+)
+def test_a_bad_on_or_update_of_is_refused(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        trigger_sql("messages", "room", "c", **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "clause"),
+    [
+        ({}, "AFTER INSERT OR UPDATE OR DELETE ON"),
+        ({"on": ("delete", "insert")}, "AFTER INSERT OR DELETE ON"),  # always in one order, whatever the caller's
+        ({"on": ["update"]}, "AFTER UPDATE ON"),
+        ({"on": {"insert"}}, "AFTER INSERT ON"),
+        ({"update_of": ("body", "body")}, 'AFTER INSERT OR UPDATE OF "room", "body" OR DELETE ON'),
+        ({"on": ("update",), "update_of": ["room"]}, 'AFTER UPDATE OF "room" ON'),
+    ],
+)
+def test_the_trigger_names_exactly_the_events_asked_for(kwargs, clause):
+    assert clause in trigger_sql("messages", "room", "c", **kwargs)
+
+
+def test_only_inserts_notify_with_on_insert(db):
+    execute(
+        db.dsn, "CREATE TABLE messages (id bigserial PRIMARY KEY, room text NOT NULL, body text, read_at timestamptz)"
+    )
+    execute(db.dsn, trigger_sql("messages", "room", db.channel, on=("insert",)))
+    with _listen(db.dsn, db.channel) as listener:
+        execute(db.dsn, "INSERT INTO messages (room, body) VALUES ('a', 'x')")
+        assert _payloads(listener) == ["a"]
+        execute(db.dsn, "UPDATE messages SET read_at = now()")  # a read receipt: no new row for any reader
+        execute(db.dsn, "UPDATE messages SET room = 'b'")
+        execute(db.dsn, "DELETE FROM messages")
+        assert _payloads(listener) == []
+
+
+def test_on_update_and_delete_leave_inserts_alone(db):
+    make_table(db)
+    execute(db.dsn, trigger_sql("messages", "room", db.channel, on=("update", "delete")))  # replaces the trigger
+    with _listen(db.dsn, db.channel) as listener:
+        execute(db.dsn, "INSERT INTO messages (room, body) VALUES ('a', 'x')")
+        assert _payloads(listener) == []
+        execute(db.dsn, "UPDATE messages SET body = 'y'")
+        assert _payloads(listener) == ["a"]
+        execute(db.dsn, "DELETE FROM messages")
+        assert _payloads(listener) == ["a"]
+
+
+def test_update_of_notifies_only_for_updates_that_name_those_columns_or_move_the_key(db):
+    execute(
+        db.dsn, "CREATE TABLE messages (id bigserial PRIMARY KEY, room text NOT NULL, body text, read_at timestamptz)"
+    )
+    execute(db.dsn, trigger_sql("messages", "room", db.channel, update_of=("body",)))
+    with _listen(db.dsn, db.channel) as listener:
+        execute(db.dsn, "INSERT INTO messages (room, body) VALUES ('a', 'x')")
+        assert _payloads(listener) == ["a"]  # inserts and deletes are still on
+        execute(db.dsn, "UPDATE messages SET read_at = now()")
+        assert _payloads(listener) == []
+        execute(db.dsn, "UPDATE messages SET body = 'edited'")
+        assert _payloads(listener) == ["a"]
+        execute(db.dsn, "UPDATE messages SET room = 'b'")  # the key column is always watched
+        assert _payloads(listener) == ["a", "b"]
+        execute(db.dsn, "DELETE FROM messages")
+        assert _payloads(listener) == ["b"]
+
+
+def test_on_does_not_touch_the_order_trigger(db):
+    execute(db.dsn, "CREATE TABLE messages (id bigserial PRIMARY KEY, room text NOT NULL)")
+    execute(db.dsn, trigger_sql("messages", "room", db.channel, order_column="id", on=("insert",)))
+    assert execute(db.dsn, "INSERT INTO messages (id, room) VALUES (1000, 'a') RETURNING id")[0][0] != 1000
+    execute(db.dsn, drop_trigger_sql("messages", "room", order_column="id"))  # drop needs no `on`
+    triggers = "SELECT count(*) FROM pg_trigger WHERE tgrelid = 'messages'::regclass AND NOT tgisinternal"
+    assert execute(db.dsn, triggers) == [(0,)]

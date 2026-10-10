@@ -536,7 +536,6 @@ wheels = [
 
 [[package]]
 name = "pg-sse"
-version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "psycopg" },
@@ -570,7 +569,7 @@ requires-dist = [
     { name = "psycopg", specifier = ">=3.2.1" },
     { name = "starlette", marker = "extra == 'starlette'", specifier = ">=0.36" },
 ]
-provides-extras = ["starlette", "fastapi"]
+provides-extras = ["fastapi", "starlette"]
 
 [package.metadata.requires-dev]
 dev = [

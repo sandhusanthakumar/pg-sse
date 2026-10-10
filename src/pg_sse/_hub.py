@@ -37,9 +37,12 @@ from ._event import Event, encode, encode_cursor, encode_goodbye
 if TYPE_CHECKING:
     from starlette.responses import StreamingResponse
 
+    from ._ephemeral import Ephemeral
+
 logger = logging.getLogger("pg_sse")
 
 # A queue holds ("notify", key) for a NOTIFY, ("wake", key, signal) for a `hub.wake`, or ("marker", m) with one of:
+# Internal: not exported, since a custom loop only needs `Subscription.ended` and the item shapes `subscribe` documents.
 RESYNC = "\x00resync"
 DROPPED = "\x00dropped"
 CLOSING = "\x00closing"
@@ -64,8 +67,9 @@ STREAM_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 _RETRY_MS = {"max_age": 1000, "behind": 1000, "busy": 30_000}
 _SHUTDOWN_RETRY_MS = (1000, 5000)  # jittered, so a deploy's reconnects are spread out
 
+# The types of `read` and `start`, public so a helper that wraps `hub.sse` can annotate them.
 Read = Callable[..., Iterable[Event] | Awaitable[Iterable[Event]]]  # read(cursor) or read(cursor, wake)
-Start = Callable[[], Any]
+Start = Callable[[], Any]  # start() gives the current cursor; plain or async
 
 
 class TooManySubscribers(Exception):
@@ -183,11 +187,12 @@ class Hub:
 
     def __init__(
         self,
-        conninfo: str,
+        conninfo: str | Callable[[], str],
         channel: str,
         *,
         max_subscribers: int = 500,
         max_per_owner: int = 5,
+        max_total_per_owner: int | None = None,
         queue_size: int = 64,
         max_stream_seconds: float = 15 * 60,
         ping_seconds: tuple[float, float] = (15.0, 25.0),
@@ -199,18 +204,26 @@ class Hub:
     ) -> None:
         if not channel or "\x00" in channel or len(channel.encode()) > 63:
             raise ValueError("channel must be a non-empty identifier of at most 63 bytes")
+        if max_total_per_owner is not None and max_total_per_owner < 1:
+            raise ValueError("max_total_per_owner must be at least 1, or None for no total")
         if queue_size < 1:
             raise ValueError("queue_size must be at least 1 (a zero-size asyncio queue is unbounded)")
         if ping_seconds[0] <= 0 or ping_seconds[0] > ping_seconds[1]:
             raise ValueError("ping_seconds must be (low, high) with 0 < low <= high")
         if reread_seconds <= 0:
             raise ValueError("reread_seconds must be greater than 0")
+        # A function is called on every connect, so a rotating password or settings that are only readable at startup
+        # need no rebuilt hub.
         self.conninfo = conninfo
         self.channel = channel
         # Open streams per process; past it a stream is refused with a 503.
         self.max_subscribers = max_subscribers
-        # Open streams per (key, owner), so one client cannot fill the process cap alone.
+        # Open streams per (key, owner): several tabs on one room are one client, but this does not stop that owner
+        # from opening streams on many keys.
         self.max_per_owner = max_per_owner
+        # Open streams per owner across all keys, or None for no total. This is the cap that keeps one client from
+        # filling `max_subscribers`; without it, an owner may hold `max_per_owner` streams on every key it can name.
+        self.max_total_per_owner = max_total_per_owner
         self.queue_size = queue_size
         # A stream is authenticated once, when it opens; ending it after this long bounds how long a revoked session
         # keeps one. The browser reconnects at once with Last-Event-ID.
@@ -233,7 +246,12 @@ class Hub:
         # requests see a live listener. Startup proceeds either way: the listener keeps retrying and `stats` reports it.
         self.listen_timeout = listen_timeout
         self._loop: asyncio.AbstractEventLoop | None = None
+        # Every open subscription, and the same ones indexed for fan-out: by key, and the ones watching every key. A
+        # notification then costs the streams it reaches, not every open stream. Change them only through
+        # `_track` and `_forget`.
         self._subscriptions: set[Subscription] = set()
+        self._by_key: dict[str, set[Subscription]] = {}
+        self._watching_all: set[Subscription] = set()
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         # Set while the listener holds a LISTEN: report it from a health check.
@@ -285,7 +303,11 @@ class Hub:
         Call it from the event loop, after any 404 or permission check: the caps are checked here, so
         `TooManySubscribers` is raised before any response exists. The stream subscribes when its first frame is read
         and unsubscribes when it ends, however it ends.
+
+        `key` must be a `str` (or None): raises `TypeError` for anything else, since a notification payload is text
+        and an int would subscribe fine and never be woken.
         """
+        _check_key(key, allow_none=True)
         self._require_loop()
         self._check_caps(key, owner)
         if end_event is None:
@@ -302,10 +324,14 @@ class Hub:
         owner: str | None = None,
         end_event: str | None = None,
         headers: Mapping[str, str] | None = None,
+        refuse_with: Callable[[TooManySubscribers], Exception] | None = None,
     ) -> "StreamingResponse":
         """
         `stream` as a Starlette/FastAPI `text/event-stream` response. Arguments as for `stream`; past a cap it raises
         a 503 with `Retry-After: 30`. Needs `pip install "pg-sse[starlette]"`. Call it from an `async def` route.
+
+        `refuse_with` replaces that 503: it gets the `TooManySubscribers` and returns the exception to raise instead,
+        e.g. one your error tracker is set to ignore, since a refused stream is back-pressure, not a fault.
         """
         try:
             from starlette.exceptions import HTTPException
@@ -316,6 +342,8 @@ class Hub:
             frames = self.stream(key, read, cursor=cursor, start=start, owner=owner, end_event=end_event)
         except TooManySubscribers as err:
             logger.warning("pg_sse refused a stream (%s)", err)
+            if refuse_with is not None:
+                raise refuse_with(err) from None
             raise HTTPException(
                 status_code=503, detail="Live updates are unavailable.", headers={"Retry-After": "30"}
             ) from None
@@ -383,12 +411,36 @@ class Hub:
     # --- subscriptions (on the event loop) ---------------------------------------------------------
 
     def subscribe(self, key: str | None, owner: str | None = None) -> Subscription:
-        """The low-level API under `stream`: a queue of notifications, wakes and markers. Unsubscribe in a `finally`."""
+        """
+        The low-level API under `stream`: a queue of notifications, wakes and markers. Unsubscribe in a `finally`.
+        `key` must be a `str` or None, as for `stream`.
+
+        `await subscription.wait(timeout)` returns everything queued once there is anything, or None on timeout. An
+        item is `("notify", key)` for a database notification, `("wake", key, signal)` for a `hub.wake`, or
+        `("marker", name)`: re-read everything. Once `subscription.ended` is true the queue holds one marker and the
+        stream is over: it fell behind, or the hub is shutting down (`hub.closing`).
+        """
+        _check_key(key, allow_none=True)
         self._require_loop()
         self._check_caps(key, owner)
         subscription = Subscription(key, owner, self.queue_size)
-        self._subscriptions.add(subscription)
+        self._track(subscription)
         return subscription
+
+    def _track(self, subscription: Subscription) -> None:
+        self._subscriptions.add(subscription)
+        if subscription.key is None:
+            self._watching_all.add(subscription)
+        else:
+            self._by_key.setdefault(subscription.key, set()).add(subscription)
+
+    def _forget(self, subscription: Subscription) -> None:
+        self._subscriptions.discard(subscription)
+        self._watching_all.discard(subscription)
+        if subscription.key is not None and (watchers := self._by_key.get(subscription.key)) is not None:
+            watchers.discard(subscription)
+            if not watchers:
+                del self._by_key[subscription.key]
 
     def _check_caps(self, key: str | None, owner: str | None) -> None:
         if self.closing:
@@ -396,9 +448,12 @@ class Hub:
         if len(self._subscriptions) >= self.max_subscribers:
             self._refuse("too many open streams")
         # Without an owner there is nobody to cap: anonymous streams on one key are not one client.
-        if owner is not None and sum(1 for s in self._subscriptions if s.key == key and s.owner == owner) >= (
-            self.max_per_owner
-        ):
+        if owner is None:
+            return
+        mine = [s for s in self._subscriptions if s.owner == owner]
+        if self.max_total_per_owner is not None and len(mine) >= self.max_total_per_owner:
+            self._refuse("too many open streams for this owner across all keys")
+        if sum(1 for s in mine if s.key == key) >= self.max_per_owner:
             self._refuse("too many open streams for this owner")
 
     def _refuse(self, reason: str) -> NoReturn:
@@ -406,7 +461,7 @@ class Hub:
         raise TooManySubscribers(reason)
 
     def unsubscribe(self, subscription: Subscription) -> None:
-        self._subscriptions.discard(subscription)
+        self._forget(subscription)
 
     def wake(self, key: str, signal: str = "wake", *, all_keys: bool = True) -> None:
         """
@@ -414,8 +469,40 @@ class Hub:
 
         A `read(cursor, wake)` sees `signal` in `wake.signals`. With `all_keys=False` the streams watching every key
         (`key=None`) are left alone: right for ephemeral per-key state that an all-keys view has nothing to show for.
+        `key` must be a `str`, as for `stream`.
         """
+        _check_key(key, allow_none=False)
         self._post(self._dispatch, ("wake", key, signal), key, all_keys)
+
+    def call_later(self, seconds: float, callback: Callable[..., None], *args: Any) -> None:
+        """
+        Runs `callback(*args)` on the hub's event loop after `seconds`. Safe from any thread; does nothing while the
+        hub has no running loop. For follow-up work on ephemeral state, e.g. checking that a typing signal lapsed, then
+        calling `wake`.
+        """
+        loop = self._loop
+        if loop is None:
+            return
+
+        def schedule() -> None:
+            loop.call_later(seconds, callback, *args)
+
+        self._post(schedule)
+
+    def ephemeral(
+        self,
+        name: str,
+        *,
+        ttl: float,
+        signal: str | None = None,
+        grace: float = 0.25,
+        all_keys: bool = False,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> "Ephemeral":
+        """`Ephemeral(self, name, ...)`: per-key signals that lapse unless renewed (typing, presence)."""
+        from ._ephemeral import Ephemeral
+
+        return Ephemeral(self, name, ttl=ttl, signal=signal, grace=grace, all_keys=all_keys, clock=clock)
 
     def close_all(self) -> None:
         """Ends every stream and refuses new ones, so a shutdown does not wait out the graceful-shutdown timeout."""
@@ -440,21 +527,29 @@ class Hub:
     def _dispatch(self, item: QueueItem, key: str | None = None, all_keys: bool = True) -> None:
         """Offers `item` to the streams for `key` and (unless `all_keys` is False) the all-keys streams; to every
         stream when `key` is None."""
-        for subscription in list(self._subscriptions):
-            if key is None or subscription.key == key or (all_keys and subscription.key is None):
-                self._offer(subscription, item)
+        if key is None:
+            targets = list(self._subscriptions)
+        else:
+            targets = list(self._by_key.get(key, ()))
+            if all_keys:
+                targets.extend(self._watching_all)
+        for subscription in targets:
+            self._offer(subscription, item)
 
     def _offer(self, subscription: Subscription, item: QueueItem) -> None:
         if not subscription.offer(item):
             # Dropped for falling behind: its stream ends on its next read, and the hub forgets it now.
             self._dropped += 1
-            self._subscriptions.discard(subscription)
+            self._forget(subscription)
 
     # --- lifecycle --------------------------------------------------------------------------------
 
     @asynccontextmanager
     async def lifespan(self, _app: Any = None) -> AsyncIterator[None]:
-        """`FastAPI(lifespan=hub.lifespan)`, or `async with hub.lifespan():` inside your own lifespan."""
+        """
+        `FastAPI(lifespan=hub.lifespan)`, or `async with hub.lifespan():` inside your own lifespan. On exit the hub
+        forgets every subscription, including `hub.subscribe` ones never unsubscribed, so it can start again clean.
+        """
         loop = asyncio.get_running_loop()
         self.start(loop)
         try:
@@ -467,6 +562,9 @@ class Hub:
             self.close_all()
             self._remove_signal_hook()
             await asyncio.to_thread(self.stop)
+            self._subscriptions.clear()
+            self._by_key.clear()
+            self._watching_all.clear()
 
     def start(self, loop: asyncio.AbstractEventLoop | None = None) -> None:
         if self._thread is not None:
@@ -533,15 +631,19 @@ class Hub:
             with contextlib.suppress(RuntimeError):  # the loop closed between the check and the call
                 loop.call_soon_threadsafe(callback, *args)
 
-    def _listen(self, stop: threading.Event) -> None:
+    def _listener_conninfo(self) -> str:
+        base = self.conninfo() if callable(self.conninfo) else self.conninfo
         settings: dict[str, Any] = dict(_TCP_KEEPALIVES)
-        if "connect_timeout" not in conninfo_to_dict(self.conninfo):
+        if "connect_timeout" not in conninfo_to_dict(base):
             settings["connect_timeout"] = _CONNECT_TIMEOUT_SECONDS
-        conninfo = make_conninfo(self.conninfo, **settings)
+        return make_conninfo(base, **settings)
+
+    def _listen(self, stop: threading.Event) -> None:
         backoff = _BACKOFF_START_SECONDS
         connected_before = False
         while not stop.is_set():
             try:
+                conninfo = self._listener_conninfo()
                 with psycopg.connect(conninfo, autocommit=True, application_name="pg-sse-listener") as conn:
                     if stop.is_set():  # `stop` gave up on this thread while it was connecting: it is not the listener
                         return
@@ -581,6 +683,19 @@ class _SignalHook:
     previous: Any
     handler: Callable[[int, FrameType | None], None] | None = None
     active: bool = True
+
+
+def _check_key(key: object, *, allow_none: bool) -> None:
+    """
+    A notification's payload is text, so a key that is not a `str` compares unequal to every payload: the stream
+    subscribes, nothing ever wakes it, and nothing logs. Refuse it where the mistake is made.
+    """
+    if isinstance(key, str) or (allow_none and key is None):
+        return
+    raise TypeError(
+        f"pg_sse: key must be a str{' or None' if allow_none else ''}, got {type(key).__name__}. "
+        "A notification carries the key column as text: pass str(key) for an integer or UUID column."
+    )
 
 
 def _goodbye(event_name: str | None, reason: str) -> str:
