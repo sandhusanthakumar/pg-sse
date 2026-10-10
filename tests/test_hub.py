@@ -11,9 +11,9 @@ import psycopg
 import pytest
 from helpers import execute, make_hub, terminate_listener, until
 
-from pg_sse import CLOSING, DROPPED, RESYNC, Hub, HubStats, TooManySubscribers, Wake
+from pg_sse import Hub, HubStats, TooManySubscribers, Wake
 from pg_sse import _hub as hub_module
-from pg_sse._hub import _accepts_wake, _wake_from
+from pg_sse._hub import CLOSING, DROPPED, RESYNC, _accepts_wake, _wake_from
 
 pytestmark = pytest.mark.anyio
 
@@ -89,8 +89,7 @@ async def test_a_stream_opened_once_the_listener_is_live_is_not_resynced(db):
     hub = make_hub(db)
     async with hub.lifespan():
         await until(hub.listening.is_set)
-        # The listener posts its first RESYNC before it sets `listening`, but the loop may not have run that callback
-        # yet when `until` returns: one yield lets it run, so this stream subscribes after it and sees nothing.
+        # The first RESYNC is posted before `listening` is set; yield once so the loop delivers it before we subscribe.
         await asyncio.sleep(0)
         assert await hub.subscribe("a").wait(0.3) is None
 
@@ -142,6 +141,39 @@ async def test_caps_per_process_and_per_owner(db):
             hub.subscribe("c")
 
 
+async def test_the_per_owner_cap_counts_one_key_and_the_total_counts_every_key(db):
+    hub = make_hub(db, max_subscribers=50, max_per_owner=2)
+    async with hub.lifespan():
+        for key in "abcdefgh":  # no total by default: one owner may hold two streams on every key it can name
+            hub.subscribe(key, owner="adam")
+            hub.subscribe(key, owner="adam")
+        assert hub.stats().open_streams == 16
+
+    hub = make_hub(db, max_subscribers=50, max_per_owner=2, max_total_per_owner=3)
+    async with hub.lifespan():
+        hub.subscribe("a", owner="adam")
+        hub.subscribe("a", owner="adam")
+        with pytest.raises(TooManySubscribers, match=r"for this owner$"):  # the per-key cap answers first
+            hub.subscribe("a", owner="adam")
+        hub.subscribe("b", owner="adam")
+        with pytest.raises(TooManySubscribers, match="across all keys"):
+            hub.subscribe("c", owner="adam")
+        hub.subscribe("c", owner="john")  # another owner, and an anonymous stream, are not counted against adam
+        hub.subscribe("c")
+        assert hub.stats().open_streams == 5
+        assert hub.stats().refused_total == 2
+
+
+async def test_a_total_per_owner_cap_refuses_a_stream_and_frees_its_slot_on_unsubscribe(db):
+    hub = make_hub(db, max_total_per_owner=1)
+    async with hub.lifespan():
+        first = hub.subscribe("a", owner="adam")
+        with pytest.raises(TooManySubscribers):
+            hub.stream("b", read=lambda after: [], owner="adam")
+        hub.unsubscribe(first)
+        hub.stream("b", read=lambda after: [], owner="adam")
+
+
 async def test_anonymous_streams_share_no_owner_cap(db):
     hub = make_hub(db, max_per_owner=1)
     async with hub.lifespan():
@@ -165,6 +197,104 @@ async def test_close_all_ends_every_stream_and_refuses_new_ones(db):
         assert subscription.queue.empty()
         with pytest.raises(TooManySubscribers, match="shutting down"):
             hub.subscribe("a")
+
+
+async def test_leaving_the_lifespan_forgets_subscriptions_nobody_unsubscribed(db):
+    hub = make_hub(db, max_subscribers=1)
+    async with hub.lifespan():
+        hub.subscribe("a")  # never unsubscribed
+        assert hub.stats().open_streams == 1
+    assert hub.stats().open_streams == 0
+    async with hub.lifespan():
+        hub.subscribe("a")  # the cap of 1 is free again
+
+
+@pytest.mark.parametrize("key", [7, 1.5, b"a", object(), True])
+async def test_a_key_that_is_not_text_is_refused_where_it_is_passed(db, key):
+    # An int from a FastAPI path parameter would subscribe and never be woken: the payload is always text.
+    hub = make_hub(db)
+    async with hub.lifespan():
+        with pytest.raises(TypeError, match=r"key must be a str or None, got .*str\(key\)"):
+            hub.stream(key, read=lambda after: [])
+        with pytest.raises(TypeError, match="key must be a str"):
+            hub.subscribe(key)
+        with pytest.raises(TypeError, match=r"key must be a str, got"):
+            hub.wake(key)
+        assert hub.stats().open_streams == 0
+        assert hub.stats().refused_total == 0  # a mistake in the caller, not back-pressure
+
+
+async def test_sse_refuses_a_key_that_is_not_text_instead_of_answering_503(db):
+    hub = make_hub(db)
+    async with hub.lifespan():
+        with pytest.raises(TypeError, match="key must be a str"):
+            hub.sse(42, read=lambda after: [])
+
+
+async def test_none_still_means_every_key_and_wake_still_needs_a_key(db):
+    hub = make_hub(db)
+    async with hub.lifespan():
+        hub.subscribe(None)
+        hub.stream(None, read=lambda after: [])
+        with pytest.raises(TypeError, match=r"key must be a str, got NoneType"):
+            hub.wake(None)  # type: ignore[arg-type]
+
+
+async def test_a_str_subclass_is_a_key(db):
+    class Room(str):
+        pass
+
+    hub = make_hub(db)
+    async with hub.lifespan():
+        await until(hub.listening.is_set)
+        subscription = hub.subscribe(Room("a"))
+        notify(db, "a")
+        assert await subscription.wait(3) == [("notify", "a")]
+
+
+async def test_a_notification_is_offered_only_to_the_streams_it_reaches(db):
+    hub = make_hub(db)
+    async with hub.lifespan():
+        for room in range(200):
+            hub.subscribe(f"room{room}")
+        same_room = [hub.subscribe("a"), hub.subscribe("a")]
+        every_room = hub.subscribe(None)
+        with mock.patch.object(hub_module.Subscription, "offer", autospec=True, return_value=True) as offer:
+            hub._dispatch(("notify", "a"), "a")
+            assert {call.args[0] for call in offer.call_args_list} == {*same_room, every_room}
+            offer.reset_mock()
+            hub._dispatch(("wake", "a", "typing"), "a", all_keys=False)
+            assert {call.args[0] for call in offer.call_args_list} == set(same_room)
+            offer.reset_mock()
+            hub._dispatch(("notify", "nobody"), "nobody")
+            assert {call.args[0] for call in offer.call_args_list} == {every_room}
+            offer.reset_mock()
+            hub._dispatch(("marker", RESYNC))  # no key: every stream
+            assert offer.call_count == 200 + 3
+
+
+async def test_the_fan_out_index_is_empty_however_a_subscription_ends(db):
+    hub = make_hub(db, queue_size=1)
+    async with hub.lifespan():
+        await until(hub.listening.is_set)
+        first, second, dropped = hub.subscribe("a"), hub.subscribe("a"), hub.subscribe("b")
+        kept_all, unsubscribed_all = hub.subscribe(None), hub.subscribe(None)
+        hub.unsubscribe(first)
+        assert hub._by_key["a"] == {second}  # the key stays while another stream watches it
+        hub.unsubscribe(second)
+        hub.unsubscribe(second)  # twice is harmless
+        assert set(hub._by_key) == {"b"}
+        hub.unsubscribe(unsubscribed_all)
+        assert hub._watching_all == {kept_all}
+        hub._dispatch(("notify", "x"), "b", all_keys=False)
+        hub._dispatch(("notify", "y"), "b", all_keys=False)  # a second distinct item overflows a queue of one
+        assert dropped.ended
+        assert hub._by_key == {}
+        assert hub._watching_all == {kept_all}
+        hub.subscribe("c")
+    assert hub._subscriptions == set()  # leaving the lifespan forgets the rest
+    assert hub._by_key == {}
+    assert hub._watching_all == set()
 
 
 async def test_a_wake_reaches_its_key_and_the_all_keys_streams_unless_told_not_to(db):
@@ -299,6 +429,70 @@ async def test_wake_does_nothing_once_the_loop_is_gone(db):
     hub.wake("a")
 
 
+async def test_call_later_runs_on_the_loop_after_the_delay_from_any_thread(db):
+    hub = make_hub(db)
+    ran: list[tuple[str, int | None]] = []
+    async with hub.lifespan():
+        loop_thread = threading.get_ident()
+        thread = threading.Thread(
+            target=hub.call_later, args=(0.05, lambda value: ran.append((value, threading.get_ident())), "x")
+        )
+        thread.start()
+        thread.join()
+        assert ran == []  # not before the delay
+        await until(lambda: bool(ran))
+    assert ran == [("x", loop_thread)]
+
+
+async def test_call_later_does_nothing_without_a_loop(db):
+    hub = make_hub(db)
+    callback = mock.Mock()
+    hub.call_later(0, callback)
+    closed = asyncio.new_event_loop()
+    closed.close()
+    hub._loop = closed
+    hub.call_later(0, callback)
+    hub._loop = mock.Mock(is_closed=lambda: False, call_soon_threadsafe=mock.Mock(side_effect=RuntimeError))
+    hub.call_later(0, callback)
+    callback.assert_not_called()
+
+
+async def test_the_dsn_may_be_a_function_called_on_every_connect(db):
+    hub = make_hub(db)
+    calls = []
+
+    def dsn() -> str:
+        calls.append(1)
+        return db.dsn
+
+    hub.conninfo = dsn
+    async with hub.lifespan():
+        await until(hub.listening.is_set)
+        assert len(calls) == 1
+        terminate_listener(db)
+        await until(lambda: len(calls) == 2)
+        await until(hub.listening.is_set)
+
+
+async def test_a_dsn_function_that_raises_is_retried_like_a_failed_connect(db, monkeypatch):
+    monkeypatch.setattr(hub_module, "_BACKOFF_START_SECONDS", 0.01)
+    hub = make_hub(db)
+    attempts = []
+
+    def dsn() -> str:
+        attempts.append(1)
+        if len(attempts) <= 2:
+            raise RuntimeError("settings are not readable yet")
+        return db.dsn
+
+    hub.conninfo = dsn
+    with mock.patch.object(hub_module.logger, "warning") as warning:
+        async with hub.lifespan():
+            await until(hub.listening.is_set)
+    assert len(attempts) == 3
+    assert warning.call_count >= 2
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
@@ -307,6 +501,7 @@ async def test_wake_does_nothing_once_the_loop_is_gone(db):
         ({"ping_seconds": (0, 1)}, "ping_seconds"),
         ({"ping_seconds": (2, 1)}, "ping_seconds"),
         ({"reread_seconds": 0}, "reread_seconds"),
+        ({"max_total_per_owner": 0}, "max_total_per_owner"),
         ({"queue_size": 0}, "queue_size"),
         ({"queue_size": -1}, "queue_size"),
     ],

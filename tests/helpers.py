@@ -1,9 +1,7 @@
-import asyncio
-import time
-
 import psycopg
 
 from pg_sse import Hub, trigger_sql
+from pg_sse.testing import until  # noqa: F401 -- re-exported for the tests
 
 
 def execute(dsn: str, query: str, params: tuple = ()) -> list[tuple]:
@@ -29,11 +27,3 @@ def terminate_listener(db) -> None:
         "WHERE application_name = 'pg-sse-listener' AND query LIKE %s",
         (f"%{db.channel}%",),
     )
-
-
-async def until(predicate, timeout: float = 5.0) -> None:
-    deadline = time.monotonic() + timeout
-    while not predicate():
-        if time.monotonic() > deadline:
-            raise AssertionError("condition not met in time")
-        await asyncio.sleep(0.02)

@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+# A new push to a pull request cancels the run it supersedes. Runs on main are never cancelled: each one is a record.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -42,6 +47,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: ${{ matrix.python }}
+          enable-cache: true  # keyed on uv.lock, the OS and the Python version
       # The locked versions are what the lock file says; lowest-direct re-resolves by design, so it cannot be --locked.
       - run: uv sync --locked
         if: matrix.resolution == 'highest'

@@ -1,6 +1,7 @@
 [project]
 name = "pg-sse"
-version = "0.1.0"
+# One place: `__version__` in src/pg_sse/__init__.py; hatchling reads it at build time.
+dynamic = ["version"]
 description = "Live updates from the Postgres you already run: LISTEN/NOTIFY wake-ups, re-reads from a cursor, served as server-sent events from any async Python framework (Starlette and FastAPI built in)."
 readme = "README.md"
 license = "MIT"
@@ -53,6 +54,9 @@ dev = [
 [build-system]
 requires = ["hatchling>=1.26"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/pg_sse/__init__.py"
 
 [tool.hatch.build.targets.sdist]
 include = ["src", "tests", "examples", "README.md", "CHANGELOG.md", "LICENSE", "llms.txt"]

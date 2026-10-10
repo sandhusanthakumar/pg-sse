@@ -5,7 +5,6 @@ import subprocess
 import sys
 import time
 from datetime import datetime
-from functools import partial
 
 import pytest
 from helpers import execute, make_hub, make_table, terminate_listener, until
@@ -205,7 +204,7 @@ async def test_an_all_keys_stream_sees_every_key_in_a_burst(db):
         return []
 
     async with hub.lifespan():
-        body = hub.stream(None, read=partial(read), cursor=0)
+        body = hub.stream(None, read=read, cursor=0)
         assert await next_frame(body) == "id: 0\n\n"  # subscribed, and the first read not yet run
         for key in ("a", "b", "a"):
             hub._dispatch(("notify", key), key)
@@ -248,9 +247,8 @@ async def test_a_stream_at_its_age_limit_says_goodbye_with_a_retry_and_ends(db, 
         body = hub.sse("lobby", read=lambda after: [], cursor=3).body_iterator
         assert await next_frame(body) == "id: 3\n\n"
         with caplog.at_level(logging.ERROR, logger="pg_sse"):
-            assert (
-                await next_frame(body) == "retry: 1000\n\n"
-            )  # no end_event: the retry alone, which dispatches nothing
+            # no end_event: the retry alone, which dispatches nothing
+            assert await next_frame(body) == "retry: 1000\n\n"
             await ended(body)
     assert caplog.text == ""
     assert hub.stats().open_streams == 0
@@ -273,9 +271,8 @@ async def test_a_stream_that_falls_behind_says_so_and_ends(db):
         last = asyncio.ensure_future(anext(body))
         await asyncio.sleep(0.05)  # the stream reads, then waits
         hub.wake("a", "x")
-        hub.wake(
-            "a", "y"
-        )  # distinct from the first, which fills the queue of one: identical wake-ups are not queued twice
+        # distinct from the first, which fills the queue of one: identical wake-ups are not queued twice
+        hub.wake("a", "y")
         assert goodbye(await asyncio.wait_for(last, 2)) == (1000, "behind")
         await ended(body)
         assert hub.stats().open_streams == 0
@@ -350,6 +347,18 @@ async def test_past_a_cap_the_client_gets_a_503(db):
             hub.sse("lobby", read=lambda after: [])
         assert refused.value.status_code == 503
         assert refused.value.headers == {"Retry-After": "30"}
+
+
+async def test_refuse_with_replaces_the_503(db):
+    class Unavailable(Exception):
+        pass
+
+    hub = make_hub(db, max_subscribers=1)
+    async with hub.lifespan():
+        await next_frame(hub.sse("lobby", read=lambda after: [], cursor=0).body_iterator)
+        with pytest.raises(Unavailable) as refused:
+            hub.sse("lobby", read=lambda after: [], refuse_with=lambda err: Unavailable(str(err)))
+        assert str(refused.value) == "too many open streams"
 
 
 async def test_extra_headers(db):
