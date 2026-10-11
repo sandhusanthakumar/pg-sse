@@ -33,7 +33,7 @@ jobs:
       PG_SSE_TEST_DSN: postgresql://sse:sse@localhost:5432/pg_sse_test
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.13"
       - run: uv sync --locked
@@ -52,7 +52,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
       - run: uv build
       # The version is `__version__` in src/pg_sse/__init__.py, read at build time, so the built files are the truth.
       - name: Tag matches the built version
@@ -71,7 +71,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
       - run: uv build
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
