@@ -1,4 +1,7 @@
 import asyncio
+import contextlib
+import contextvars
+import functools
 import gc
 import json
 import logging
@@ -15,10 +18,19 @@ import pytest
 from helpers import execute, make_hub, make_table, terminate_listener, until
 from starlette.exceptions import HTTPException
 
-from pg_sse import EndedTotals, Event, Hub, TooManySubscribers, Wake
+from pg_sse import EndedTotals, Event, Hub, Subscription, TooManySubscribers, Wake
 from pg_sse import _hub as hub_module
 
 pytestmark = pytest.mark.anyio
+
+
+def says(answer):
+    """A `revalidate` that always gives `answer`."""
+
+    async def check():
+        return answer
+
+    return check
 
 
 def insert(db, room: str, body: str) -> int:
@@ -386,6 +398,669 @@ async def test_a_revoked_streams_goodbye_says_so_and_the_stream_ends(db):
         assert hub.stats().ended_total == EndedTotals(revoked=1)
 
 
+async def _all_frames(body) -> list[str]:
+    return [frame async for frame in body]
+
+
+async def test_a_stream_whose_revalidate_says_no_ends_with_revoked_even_when_no_ping_is_due(db):
+    checks = []
+
+    async def allowed():
+        checks.append(time.monotonic())
+        return len(checks) < 3
+
+    hub = make_hub(db, end_event="end", ping_seconds=(30, 30), revalidate_seconds=0.05)
+    async with hub.lifespan():
+        body = hub.stream("lobby", read=lambda after: [], cursor=0, revalidate=allowed)
+        assert await next_frame(body) == "id: 0\n\n"
+        assert goodbye(await next_frame(body)) == (1000, "revoked")  # on its own clock, not at a ping
+        await ended(body)
+        assert hub.stats().open_streams == 0
+        assert hub.stats().ended_total == EndedTotals(revoked=1)
+        assert hub.stats().read_errors_total == 0
+    assert len(checks) == 3
+
+
+async def test_a_stream_in_a_long_read_is_ended_at_once_when_its_revalidate_says_no(db):
+    started = asyncio.Event()
+
+    async def slow_read(after):
+        started.set()
+        await asyncio.sleep(30)
+
+    hub = make_hub(db, end_event="end", revalidate_seconds=0.3)
+    async with hub.lifespan():
+        body = hub.stream("lobby", read=slow_read, cursor=0, revalidate=says(False))
+        assert await next_frame(body) == "id: 0\n\n"
+        waiting = asyncio.ensure_future(next_frame(body))
+        await asyncio.wait_for(started.wait(), 3)  # the read is running when the check says no
+        assert goodbye(await waiting) == (1000, "revoked")
+        assert hub.stats().read_errors_total == 0
+
+
+async def test_a_stream_that_revalidate_keeps_goes_on(db):
+    checks = []
+
+    async def allowed():
+        checks.append(1)
+        return True
+
+    hub = make_hub(db, ping_seconds=(0.05, 0.05), revalidate_seconds=0.05)
+    async with hub.lifespan():
+        consumer = consume(hub.stream("lobby", read=lambda after: [], cursor=0, revalidate=allowed))
+        await until(lambda: len(checks) >= 3)
+        assert not consumer.done()
+        assert hub.stats().ended_total == EndedTotals()
+        await stop(consumer)
+
+
+async def test_the_first_revalidate_comes_about_one_interval_after_the_stream_starts(db):
+    first = []
+
+    async def first_check():
+        first.append(time.monotonic())
+        return True
+
+    hub = make_hub(db, revalidate_seconds=0.2)
+    async with hub.lifespan():
+        started = time.monotonic()
+        consumer = consume(hub.stream("lobby", read=lambda after: [], cursor=0, revalidate=first_check))
+        await until(lambda: first)
+        await stop(consumer)
+    assert (
+        0.14 <= first[0] - started <= 1.5
+    )  # 0.2 s, give or take the quarter that spreads streams out, and a slow runner
+
+
+async def test_revalidate_runs_on_the_event_loop(db):
+    where = []
+
+    async def on_the_loop():
+        where.append(threading.current_thread())
+        return False
+
+    hub = make_hub(db, revalidate_seconds=0.05)
+    async with hub.lifespan():
+        body = hub.stream("lobby", read=lambda after: [], cursor=0, revalidate=on_the_loop)
+        assert goodbye((await _all_frames(body))[-1])[0] == 1000
+    assert where == [threading.current_thread()]
+
+
+async def test_a_revalidate_does_not_wait_behind_a_slow_read(db):
+    with ThreadPoolExecutor(1, thread_name_prefix="reads") as executor:
+        hub = make_hub(db, end_event="end", revalidate_seconds=0.05, read_executor=executor)
+        async with hub.lifespan():
+            first = time.monotonic()
+            body = hub.stream("lobby", read=lambda after: time.sleep(2.0) or [], cursor=0, revalidate=says(False))
+            frames = await _all_frames(body)
+            assert goodbye(frames[-1])[1] == "revoked"  # the check did not wait for the read's thread
+            assert time.monotonic() - first < 1.6
+
+
+async def test_each_hub_limits_its_own_revalidate_log_lines(db, caplog):
+    async def broken():
+        raise ConnectionError("session store down")
+
+    first, second = make_hub(db, revalidate_seconds=0.03), make_hub(db, revalidate_seconds=0.03)
+    with caplog.at_level(logging.WARNING, logger="pg_sse"):
+        async with first.lifespan():
+            consumer = consume(first.stream("lobby", read=lambda after: [], cursor=0, revalidate=broken))
+            await until(lambda: "revalidate failed" in caplog.text)
+            await stop(consumer)
+        caplog.clear()
+        async with second.lifespan():
+            consumer = consume(second.stream("lobby", read=lambda after: [], cursor=0, revalidate=broken))
+            await until(lambda: "revalidate failed" in caplog.text)  # not held back by the first hub's line
+            await stop(consumer)
+
+
+async def test_revalidate_runs_with_the_context_variables_of_the_task_that_reads_the_stream(db):
+    seen = []
+    scoped = contextvars.ContextVar("scoped", default="unset")
+
+    async def allowed():
+        seen.append(scoped.get())
+        return False
+
+    async def read_it(body):
+        scoped.set("by the reader")  # as a server sets its request scope before it iterates the response
+        return await _all_frames(body)
+
+    hub = make_hub(db, revalidate_seconds=0.05)
+    async with hub.lifespan():
+        await read_it(hub.stream("lobby", read=lambda after: [], cursor=0, revalidate=allowed))
+    assert seen == ["by the reader"]
+
+
+async def test_a_stream_stuck_in_its_start_is_still_revalidated(db):
+    async def hangs():
+        await asyncio.Event().wait()
+
+    hub = make_hub(db, end_event="end", revalidate_seconds=0.05)
+    async with hub.lifespan():
+        body = hub.stream("lobby", read=lambda after: [], start=hangs, revalidate=says(False))
+        frames = await asyncio.wait_for(_all_frames(body), 3)
+        assert goodbye(frames[-1])[1] == "revoked"
+
+
+async def test_a_revalidate_that_keeps_failing_ends_the_stream_with_recheck_and_is_reported(db, caplog):
+    errors = []
+    hub = make_hub(
+        db,
+        end_event="end",
+        revalidate_seconds=0.05,
+        revalidate_failures=3,
+        on_error=lambda key, err: errors.append((key, str(err))),
+    )
+
+    async def broken():
+        raise ConnectionError("session store down")
+
+    async with hub.lifespan():
+        body = hub.stream("lobby", read=lambda after: [], cursor=0, revalidate=broken)
+        with caplog.at_level(logging.WARNING, logger="pg_sse"):
+            frames = await _all_frames(body)
+        await until(lambda: errors)
+        retry, reason = goodbye(frames[-1])
+        assert (1000 <= retry <= 5000, reason) == (True, "recheck")  # spread out, like a shutdown's
+        assert hub.stats().ended_total == EndedTotals(recheck=1)
+        assert hub.stats().open_streams == 0
+    # The two before it only warn (once a minute at most): the stream they end is reported once.
+    assert errors == [("lobby", "session store down")]
+    assert hub.stats().read_errors_total == 0  # not a failed read: `ended_total.recheck` and the errors below count it
+    assert hub.stats().revalidate_errors_total == 3
+    assert "revalidate failed for key 'lobby' (1 in a row" in caplog.text
+    assert "session store down" in caplog.text
+
+
+async def test_a_revalidate_that_fails_now_and_then_does_not_end_the_stream(db):
+    calls = []
+    errors = []
+
+    async def flaky():
+        calls.append(1)
+        if len(calls) in (1, 2, 4, 5):  # two in a row, a good one, two in a row: never the three that end a stream
+            raise ConnectionError("session store down")
+        return True
+
+    hub = make_hub(db, revalidate_seconds=0.03, revalidate_failures=3, on_error=lambda key, err: errors.append(key))
+    async with hub.lifespan():
+        consumer = consume(hub.stream("lobby", read=lambda after: [], cursor=0, revalidate=flaky))
+        await until(lambda: len(calls) >= 8)
+        assert not consumer.done()
+        assert hub.stats().ended_total == EndedTotals()
+        assert hub.stats().read_errors_total == 0  # no stream failed
+        await stop(consumer)
+    assert errors == []  # nor reported: only the failure that ends a stream is
+
+
+async def test_a_revalidate_whose_answer_cannot_be_read_counts_as_a_failure(db):
+    class Unreadable:
+        def __bool__(self):
+            raise ValueError("ambiguous")
+
+    async def unreadable():
+        return Unreadable()
+
+    hub = make_hub(db, end_event="end", revalidate_seconds=0.03, revalidate_failures=1)
+    async with hub.lifespan():
+        body = hub.stream("lobby", read=lambda after: [], cursor=0, revalidate=unreadable)
+        assert goodbye((await asyncio.wait_for(_all_frames(body), 3))[-1])[1] == "recheck"
+
+
+async def test_a_revalidate_that_cancels_its_own_task_ends_the_stream_with_recheck(db):
+    async def cancels():
+        raise asyncio.CancelledError
+
+    hub = make_hub(db, end_event="end", revalidate_seconds=0.03, revalidate_failures=3)
+    async with hub.lifespan():
+        body = hub.stream("lobby", read=lambda after: [], cursor=0, revalidate=cancels)
+        assert goodbye((await asyncio.wait_for(_all_frames(body), 3))[-1])[1] == "recheck"
+        assert hub.stats().revalidate_errors_total == 3
+
+
+async def test_a_revalidate_is_not_run_for_a_stream_that_was_already_closed(db):
+    checks = []
+
+    async def counted():
+        checks.append(1)
+        return True
+
+    hub = make_hub(db, end_event="end", revalidate_seconds=0.6)
+    async with hub.lifespan():
+        body = hub.stream("lobby", read=lambda after: [], cursor=0, owner="ann", revalidate=counted)
+        assert await next_frame(body) == "id: 0\n\n"
+        waiting = asyncio.ensure_future(next_frame(body))
+        await asyncio.sleep(0.02)
+        hub.close(owner="ann")
+        assert goodbye(await waiting) == (1000, "revoked")
+        await asyncio.sleep(0.9)  # the stream has not been told to go: the check's time (0.45 to 0.75 s) comes and goes
+        await ended(body)
+    assert checks == []
+
+
+async def test_the_streams_a_failing_revalidate_ends_together_are_all_reported_and_logged_once(db, caplog):
+    errors = []
+    hub = make_hub(
+        db,
+        end_event="end",
+        revalidate_seconds=0.03,
+        on_error=lambda key, err: errors.append(key),
+        revalidate_failures=1,
+    )
+
+    async def broken():
+        raise ConnectionError("session store down")
+
+    async with hub.lifespan():
+        bodies = [hub.stream(f"room-{n}", read=lambda after: [], cursor=0, revalidate=broken) for n in range(5)]
+        with caplog.at_level(logging.ERROR, logger="pg_sse"):
+            ends = await asyncio.wait_for(asyncio.gather(*(_all_frames(body) for body in bodies)), 3)
+        await until(lambda: len(errors) == 5)
+    assert [goodbye(frames[-1])[1] for frames in ends] == ["recheck"] * 5
+    assert hub.stats().read_errors_total == 0
+    assert hub.stats().revalidate_errors_total == 5
+    assert hub.stats().ended_total == EndedTotals(recheck=5)
+    assert len(errors) == 5  # `on_error` hears of every stream, the log says it once a minute
+    assert len([record for record in caplog.records if record.levelno == logging.ERROR]) == 1
+
+
+async def test_without_a_failure_limit_a_revalidate_that_keeps_failing_only_warns_and_is_counted(db, caplog):
+    calls = []
+
+    async def broken():
+        calls.append(1)
+        raise ConnectionError("session store down")
+
+    hub = make_hub(db, revalidate_seconds=0.03, revalidate_failures=None)
+    async with hub.lifespan():
+        with caplog.at_level(logging.WARNING, logger="pg_sse"):
+            consumer = consume(hub.stream("lobby", read=lambda after: [], cursor=0, revalidate=broken))
+            await until(lambda: len(calls) >= 6)
+        assert not consumer.done()
+        assert hub.stats().read_errors_total == 0
+        assert hub.stats().revalidate_errors_total >= 5
+        await stop(consumer)
+    assert "session store down" in caplog.text
+
+
+async def test_a_revalidate_that_answers_none_says_no(db):
+    async def forgot_to_return():
+        return None
+
+    hub = make_hub(db, end_event="end", revalidate_seconds=0.03)
+    async with hub.lifespan():
+        body = hub.stream("lobby", read=lambda after: [], cursor=0, revalidate=forgot_to_return)
+        assert goodbye((await asyncio.wait_for(_all_frames(body), 3))[-1])[1] == "revoked"
+        assert hub.stats().revalidate_errors_total == 0
+
+
+async def test_a_revalidate_that_swallows_the_cancel_of_a_forgotten_stream_is_not_called_again(db):
+    calls = []
+
+    async def stubborn():
+        calls.append(1)
+        with contextlib.suppress(asyncio.CancelledError):  # a check that does not let itself be cancelled
+            await asyncio.sleep(0.2)
+        return True
+
+    hub = make_hub(db, revalidate_seconds=0.03)
+    async with hub.lifespan():
+        consumer = consume(hub.stream("lobby", read=lambda after: [], cursor=0, revalidate=stubborn))
+        (subscription,) = hub._subscriptions
+        await until(lambda: calls)
+        await stop(consumer)  # the client leaves while the check runs
+        await until(lambda: subscription.watch is not None and subscription.watch.done())
+        await asyncio.sleep(0.1)
+        assert calls == [1]
+
+
+async def test_the_warning_for_a_failed_revalidate_carries_its_traceback(db, caplog):
+    async def broken():
+        raise KeyError("session")
+
+    hub = make_hub(db, revalidate_seconds=0.03)
+    async with hub.lifespan():
+        with caplog.at_level(logging.WARNING, logger="pg_sse"):
+            consumer = consume(hub.stream("lobby", read=lambda after: [], cursor=0, revalidate=broken))
+            await until(lambda: "revalidate failed" in caplog.text)
+            await stop(consumer)
+    assert "Traceback" in caplog.text
+    assert "in broken" in caplog.text
+
+
+async def test_an_on_error_wrapped_by_a_decorator_is_called_as_the_function_it_wraps_takes_its_arguments(db):
+    reported = []
+
+    def with_tracker(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    @with_tracker
+    def report(key, exc, info):
+        reported.append((key, info.key))
+
+    hub = make_hub(db, on_error=report)
+    async with hub.lifespan():
+        body = hub.stream("lobby", read=lambda after: [{"not": "an event"}])
+        with pytest.raises(StopAsyncIteration):
+            await next_frame(body)
+        await until(lambda: not hub._error_reports)
+    assert reported == [("lobby", "lobby")]
+
+
+async def test_a_revalidate_that_fails_as_it_is_cancelled_is_not_a_failure(db):
+    started = asyncio.Event()
+    errors = []
+
+    async def hangs():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise ConnectionError("pool closed under it") from None
+
+    hub = make_hub(db, revalidate_seconds=0.03, revalidate_failures=1, on_error=lambda key, err: errors.append(key))
+    async with hub.lifespan():
+        consumer = consume(hub.stream("lobby", read=lambda after: [], cursor=0, revalidate=hangs))
+        await asyncio.wait_for(started.wait(), 3)
+        await stop(consumer)  # the client leaves while the check runs
+        await until(lambda: hub.stats().open_streams == 0)
+        await asyncio.sleep(0.05)
+        assert hub.stats().read_errors_total == 0
+        assert hub.stats().revalidate_errors_total == 0
+    assert errors == []
+
+
+async def test_a_revalidate_that_hangs_is_cut_off_and_the_stream_rechecks(db):
+    async def hangs():
+        await asyncio.Event().wait()
+
+    errors = []
+    hub = make_hub(
+        db,
+        end_event="end",
+        revalidate_seconds=0.05,
+        revalidate_timeout=0.1,
+        revalidate_failures=1,
+        on_error=lambda key, err: errors.append(str(err)),
+    )
+    async with hub.lifespan():
+        body = hub.stream("lobby", read=lambda after: [], cursor=0, revalidate=hangs)
+        frames = await asyncio.wait_for(_all_frames(body), 3)
+        assert goodbye(frames[-1])[1] == "recheck"
+        assert hub.stats().revalidate_errors_total == 1
+        await until(lambda: not hub._error_reports)
+    assert errors == ["revalidate took more than 0.1 s"]
+
+
+async def test_a_stream_closed_while_revalidate_runs_says_revoked_and_reports_nothing(db):
+    started = asyncio.Event()
+    cancelled = []
+
+    async def hangs():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.append(1)
+            raise
+
+    hub = make_hub(db, end_event="end", revalidate_seconds=0.05)
+    async with hub.lifespan():
+        body = hub.stream("lobby", read=lambda after: [], cursor=0, owner="ann", revalidate=hangs)
+        consumer = asyncio.ensure_future(_all_frames(body))
+        await asyncio.wait_for(started.wait(), 3)
+        hub.close(owner="ann")
+        assert goodbye((await asyncio.wait_for(consumer, 3))[-1]) == (1000, "revoked")
+        assert hub.stats().read_errors_total == 0
+        await until(lambda: cancelled)  # the check is not left running once the stream is gone
+
+
+@pytest.mark.parametrize("failures", [1, 3])
+@pytest.mark.parametrize("outcome", ["raises", "true", "false"])
+async def test_a_revalidate_that_finishes_after_the_stream_was_closed_changes_nothing(db, outcome, failures):
+    started, gate = asyncio.Event(), asyncio.Event()
+
+    async def late():
+        started.set()
+        await gate.wait()
+        if outcome == "raises":
+            raise ConnectionError("session store down")
+        return outcome == "true"
+
+    hub = make_hub(db, end_event="end", revalidate_seconds=0.05, revalidate_failures=failures)
+    async with hub.lifespan():
+        body = hub.stream("lobby", read=lambda after: [], cursor=0, owner="ann", revalidate=late)
+        assert await next_frame(body) == "id: 0\n\n"
+        waiting = asyncio.ensure_future(next_frame(body))
+        await asyncio.wait_for(started.wait(), 3)
+        hub.close(owner="ann")
+        gate.set()
+        await asyncio.sleep(0.05)  # the check ends while the stream has not taken its goodbye yet
+        assert goodbye(await waiting) == (1000, "revoked")
+        await ended(body)
+        assert hub.stats().read_errors_total == 0
+        assert hub.stats().revalidate_errors_total == 0  # it failed because its stream was closed, not by itself
+        assert hub.stats().ended_total == EndedTotals(revoked=1)
+
+
+class _Abort(BaseException):
+    """An exception type of the app's own that is not an `Exception`."""
+
+
+async def test_a_revalidate_that_raises_something_that_is_no_exception_is_a_failure_not_the_end_of_its_watch(db):
+    calls = []
+
+    async def aborts():
+        calls.append(1)
+        raise _Abort
+
+    hub = make_hub(db, revalidate_seconds=0.03, revalidate_failures=None)
+    async with hub.lifespan():
+        consumer = consume(hub.stream("lobby", read=lambda after: [], cursor=0, revalidate=aborts))
+        await until(lambda: len(calls) >= 3)  # it keeps being checked
+        assert hub.stats().revalidate_errors_total >= 2
+        await stop(consumer)
+
+
+async def test_a_watch_that_breaks_ends_its_stream_with_recheck_instead_of_leaving_it_unchecked(db, caplog):
+    errors = []
+    hub = make_hub(db, end_event="end", on_error=lambda key, err: errors.append(type(err).__name__))
+    hub.revalidate_seconds = "soon"  # type: ignore[assignment]  # a public attribute set to nonsense after construction
+    async with hub.lifespan():
+        body = hub.stream("lobby", read=lambda after: [], cursor=0, revalidate=says(True))
+        with caplog.at_level(logging.ERROR, logger="pg_sse"):
+            frames = await asyncio.wait_for(_all_frames(body), 3)
+        await until(lambda: errors)
+    assert goodbye(frames[-1])[1] == "recheck"
+    assert errors == ["TypeError"]
+    assert "ended: its revalidate broke" in caplog.text
+    assert hub.stats().revalidate_errors_total == 1
+
+
+async def test_the_log_line_for_broken_watches_is_said_once_a_minute_but_every_stream_is_reported(db, caplog):
+    errors = []
+    hub = make_hub(db, end_event="end", on_error=lambda key, err: errors.append(key))
+    hub.revalidate_seconds = "soon"  # type: ignore[assignment]
+    async with hub.lifespan():
+        bodies = [hub.stream(f"room-{n}", read=lambda after: [], cursor=0, revalidate=says(True)) for n in range(3)]
+        with caplog.at_level(logging.ERROR, logger="pg_sse"):
+            await asyncio.wait_for(asyncio.gather(*(_all_frames(body) for body in bodies)), 3)
+        await until(lambda: len(errors) == 3)
+    assert len([record for record in caplog.records if "its revalidate broke" in record.message]) == 1
+    assert hub.stats().revalidate_errors_total == 3
+
+
+async def test_a_watch_that_breaks_without_a_failure_limit_only_warns(db, caplog):
+    hub = make_hub(db, revalidate_failures=None)
+    hub.revalidate_seconds = "soon"  # type: ignore[assignment]
+    async with hub.lifespan():
+        with caplog.at_level(logging.WARNING, logger="pg_sse"):
+            consumers = [
+                consume(hub.stream(f"room-{n}", read=lambda after: [], cursor=0, revalidate=says(True)))
+                for n in range(2)
+            ]
+            await until(lambda: hub.stats().revalidate_errors_total == 2)
+        assert not any(consumer.done() for consumer in consumers)
+        assert hub.stats().ended_total == EndedTotals()
+        assert caplog.text.count("no longer checked") == 1  # said once a minute for the hub
+        for consumer in consumers:
+            await stop(consumer)
+
+
+async def test_a_watch_cancelled_from_outside_while_its_stream_goes_on_ends_it_with_recheck(db):
+    hub = make_hub(db, end_event="end", revalidate_seconds=30)
+    async with hub.lifespan():
+        body = hub.stream("lobby", read=lambda after: [], cursor=0, revalidate=says(True))
+        consumer = asyncio.ensure_future(_all_frames(body))
+        (subscription,) = hub._subscriptions
+        await until(lambda: subscription.watch is not None)
+        subscription.watch.cancel()
+        assert goodbye((await asyncio.wait_for(consumer, 3))[-1])[1] == "recheck"
+
+
+async def test_a_revalidate_that_ends_its_stream_by_failing_says_so_in_the_log(db, caplog):
+    hub = make_hub(db, revalidate_seconds=0.03, revalidate_failures=2)
+
+    async def broken():
+        raise ConnectionError("session store down")
+
+    async with hub.lifespan():
+        body = hub.stream("lobby", read=lambda after: [], cursor=0, revalidate=broken)
+        with caplog.at_level(logging.ERROR, logger="pg_sse"):
+            await asyncio.wait_for(_all_frames(body), 3)
+    assert "ended: its revalidate failed 2 times in a row" in caplog.text
+
+
+async def test_a_revalidate_that_swallows_the_cancel_of_its_timeout_still_counts_as_over_the_limit(db):
+    errors = []
+
+    async def stubborn():
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.Event().wait()
+        return True  # answered, though the time was up
+
+    hub = make_hub(
+        db,
+        end_event="end",
+        revalidate_seconds=0.03,
+        revalidate_timeout=0.05,
+        revalidate_failures=1,
+        on_error=lambda key, err: errors.append(str(err)),
+    )
+    async with hub.lifespan():
+        body = hub.stream("lobby", read=lambda after: [], cursor=0, revalidate=stubborn)
+        assert goodbye((await asyncio.wait_for(_all_frames(body), 3))[-1])[1] == "recheck"
+        await until(lambda: errors)
+    assert errors == ["revalidate took more than 0.05 s"]
+
+
+async def test_a_timeout_of_the_apps_own_is_reported_as_it_was_raised(db):
+    errors = []
+
+    async def times_out():
+        raise TimeoutError("redis did not answer in 2 s")
+
+    hub = make_hub(
+        db,
+        end_event="end",
+        revalidate_seconds=0.03,
+        revalidate_failures=1,
+        on_error=lambda key, err: errors.append(str(err)),
+    )
+    async with hub.lifespan():
+        body = hub.stream("lobby", read=lambda after: [], cursor=0, revalidate=times_out)
+        assert goodbye((await asyncio.wait_for(_all_frames(body), 3))[-1])[1] == "recheck"
+        await until(lambda: errors)
+    assert errors == ["redis did not answer in 2 s"]  # not "revalidate took more than 10 s"
+
+
+async def test_a_stream_that_ends_stops_its_revalidate(db):
+    hub = make_hub(db, max_stream_seconds=0.2, revalidate_seconds=0.05)
+    async with hub.lifespan():
+        body = hub.stream("lobby", read=lambda after: [], cursor=0, revalidate=says(True))
+        (subscription,) = hub._subscriptions
+        await _all_frames(body)
+        assert subscription.watch is not None
+        await until(subscription.watch.done)
+
+
+async def test_sse_passes_revalidate_on_and_refuses_one_that_cannot_be_called(db):
+    hub = make_hub(db, revalidate_seconds=0.05)
+    async with hub.lifespan():
+        response = hub.sse("lobby", read=lambda after: [], cursor=0, revalidate=says(False))
+        frames = [frame async for frame in response.body_iterator]
+        assert goodbye(frames[-1])[0] == 1000
+        with pytest.raises(TypeError, match="revalidate must be an async function"):
+            hub.stream("lobby", read=lambda after: [], revalidate="yes")  # type: ignore[arg-type]
+        assert hub.stats().open_streams == 0
+
+
+async def test_an_on_error_that_takes_a_third_argument_gets_the_streams_owner_and_age(db):
+    reported = []
+    hub = make_hub(db, on_error=lambda key, err, info: reported.append((key, str(err), info)))
+
+    def read(after):
+        time.sleep(0.05)
+        raise ConnectionError("database went away")
+
+    async with hub.lifespan():
+        body = hub.stream("lobby", read=read, owner=7)
+        with pytest.raises(StopAsyncIteration):
+            await next_frame(body)
+        await until(lambda: not hub._error_reports)
+    ((key, message, info),) = reported
+    assert (key, message) == ("lobby", "database went away")
+    assert (info.key, info.owner, info.ended) == ("lobby", "7", False)
+    assert info.age_seconds >= 0.05
+
+
+async def test_the_log_line_leaves_the_owner_out_unless_asked(db, caplog):
+    errors = []
+    hub = make_hub(db, on_error=lambda key, err, info: errors.append(info.owner))
+
+    def read(after):
+        raise ConnectionError("database went away")
+
+    async with hub.lifespan():
+        body = hub.stream("lobby", read=read, owner="session-token")
+        with caplog.at_level(logging.ERROR, logger="pg_sse"), pytest.raises(StopAsyncIteration):
+            await next_frame(body)
+        await until(lambda: not hub._error_reports)
+    assert "key 'lobby' (open " in caplog.text
+    assert "session-token" not in caplog.text
+    assert errors == ["session-token"]  # `on_error` is the app's own, and still gets it
+
+
+async def test_an_on_error_set_after_the_hub_was_made_is_called_as_it_is_declared(db):
+    reported = []
+    hub = make_hub(db, on_error=lambda key, err: reported.append(("two", key)))
+    hub.on_error = lambda key, err, info: reported.append(("three", info.key))
+    async with hub.lifespan():
+        body = hub.stream("lobby", read=lambda after: [{"not": "an event"}])
+        with pytest.raises(StopAsyncIteration):
+            await next_frame(body)
+        await until(lambda: not hub._error_reports)
+    assert reported == [("three", "lobby")]
+
+
+async def test_the_log_line_for_a_failed_stream_names_its_owner_when_asked(db, caplog):
+    hub = make_hub(db, log_owner=True)
+
+    def read(after):
+        raise ConnectionError("database went away")
+
+    async with hub.lifespan():
+        body = hub.stream("lobby", read=read, owner="ann")
+        with caplog.at_level(logging.ERROR, logger="pg_sse"), pytest.raises(StopAsyncIteration):
+            await next_frame(body)
+    assert "key 'lobby' (owner 'ann', open " in caplog.text
+
+
 async def test_a_failing_read_is_counted_and_reported_to_on_error(db):
     errors = []
     hub = make_hub(db, on_error=lambda key, err: errors.append((key, err)))
@@ -513,11 +1188,12 @@ async def test_leaving_the_lifespan_also_waits_for_a_report_that_starts_while_it
         await asyncio.sleep(0.05)
         finished.append(key)
         if key == "first":
-            hub._report("late", err)  # as a read still running in a thread would, failing during shutdown
+            # as a read still running in a thread would, failing during shutdown
+            hub._report(Subscription("late", None, 1), err)
 
     hub = make_hub(db, on_error=report)
     async with hub.lifespan():
-        hub._report("first", ConnectionError("database went away"))
+        hub._report(Subscription("first", None, 1), ConnectionError("database went away"))
     assert finished == ["first", "late"]
 
 

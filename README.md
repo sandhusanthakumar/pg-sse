@@ -1,9 +1,9 @@
 # pg-sse
 
-[![CI](https://github.com/sandhusanthakumar/pg-sse/actions/workflows/ci.yml/badge.svg)](https://github.com/sandhusanthakumar/pg-sse/actions/workflows/ci.yml)
+[![CI](https://github.com/sansanth/pg-sse/actions/workflows/ci.yml/badge.svg)](https://github.com/sansanth/pg-sse/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/pg-sse)](https://pypi.org/project/pg-sse/)
 [![Python versions](https://img.shields.io/pypi/pyversions/pg-sse)](https://pypi.org/project/pg-sse/)
-[![License](https://img.shields.io/pypi/l/pg-sse)](https://github.com/sandhusanthakumar/pg-sse/blob/main/LICENSE)
+[![License](https://img.shields.io/pypi/l/pg-sse)](https://github.com/sansanth/pg-sse/blob/main/LICENSE)
 
 Live updates from the Postgres you already run. No Redis, no broker, no WebSocket service: a table trigger sends `NOTIFY`, one listener per process wakes the open streams, and each stream re-reads from its cursor and sends server-sent events. Works with Starlette and FastAPI out of the box, and with any other framework through `hub.stream`.
 
@@ -45,7 +45,8 @@ That creates two triggers:
 ```python
 from typing import Annotated
 from fastapi import FastAPI, Header
-from pg_sse import Event, Hub, IntCursor
+from fastapi.responses import StreamingResponse
+from pg_sse import Event, Hub, IntCursor, event_stream_responses
 
 hub = Hub(DIRECT_DATABASE_URL, channel="room_change")  # a direct connection, not a pooled one
 app = FastAPI(lifespan=hub.lifespan)
@@ -61,11 +62,13 @@ def latest_id(room: str) -> int:
     return db.fetchval("SELECT coalesce(max(id), 0) FROM messages WHERE room = %s", (room,))
 
 
-@app.get("/rooms/{room}/stream")
+@app.get("/rooms/{room}/stream", responses=event_stream_responses(), response_class=StreamingResponse)
 async def stream(room: str, last_event_id: Annotated[str | None, Header()] = None):
     cursor = cursors.parse_one(last_event_id)  # None for no header or one that is not a cursor: start from now
     return hub.sse(room, read=lambda after: read_after(room, after), cursor=cursor, start=lambda: latest_id(room))
 ```
+
+FastAPI cannot see what `hub.sse` returns, so without the `responses=` and `response_class=` in the decorator the route is missing from the OpenAPI document as an event stream. `event_stream_responses()` declares `text/event-stream` and the `Cache-Control` and `X-Accel-Buffering` headers. Without `response_class`, FastAPI lists `application/json` for the route too. It returns a new dict, so you can add responses to it (`{**event_stream_responses(), 404: {...}}`), and takes the `status_code` of a route that does not return 200.
 
 **3. The browser:**
 
@@ -76,7 +79,7 @@ source.onmessage = (e) => render(JSON.parse(e.data));
 
 `EventSource` reconnects by itself and sends `Last-Event-ID`; the stream catches up from there. The header is client input, so `IntCursor` lets only digits through, and the route starts anything else from now, as if there were no header. Not a 422: `EventSource` stops for good on any response that is not a 200, so one stale or malformed id (an old cursor format after a deploy) would end live updates in that tab. Do not hand-roll the check with `str.isdigit()`: it is true for `²`, which `int()` then rejects, so a client could turn the route into a 500.
 
-A full runnable app, with async reads on a connection pool and a browser page: [examples/chat.py](https://github.com/sandhusanthakumar/pg-sse/blob/main/examples/chat.py).
+A full runnable app, with async reads on a connection pool and a browser page: [examples/chat.py](https://github.com/sansanth/pg-sse/blob/main/examples/chat.py).
 
 **Notify only for the writes a reader can see.** By default every insert, update and delete notifies. A cursor-based `read` only finds new rows, so on a table with edits, read receipts or soft deletes, each update would wake every reader of that key for a read that returns nothing. Say which writes matter:
 
@@ -248,7 +251,7 @@ hub.sse(room, read=read)
 # sends: "ready" first; "resync" after a reconnect or a quiet re-read; "messages" for a write; "typing" for that signal
 ```
 
-A runnable version, with a typing indicator that lapses on its own and an inbox that watches every room: [examples/inbox.py](https://github.com/sandhusanthakumar/pg-sse/blob/main/examples/inbox.py).
+A runnable version, with a typing indicator that lapses on its own and an inbox that watches every room: [examples/inbox.py](https://github.com/sansanth/pg-sse/blob/main/examples/inbox.py).
 
 A one-parameter `read(cursor)` works too, and so does one whose second parameter has a default under another name (`read(after, limit=500)`): only a parameter named `wake`, or a required one, receives the `Wake`. `hub.wake(key)` reaches the streams for `key` and the all-keys streams (`key=None`); `all_keys=False` keeps it on its key, which is right for ephemeral per-key state (typing, presence, a cursor position) that an all-keys view has nothing to show for. Database notifications always reach the all-keys streams: they report real writes.
 
@@ -285,7 +288,7 @@ typing.live(room_id)  # ["ann", "bo"]: who has not lapsed, for the GET the page 
 - **Wakes every stream after the listener connects or reconnects**, since anything committed before its LISTEN existed (at startup, or while it was down) was missed. Each stream re-reads after its own random delay of up to `resync_spread` (2 s), so the reads do not arrive together. Reconnects with backoff; a `SELECT 1` every minute and TCP keepalives catch a half-open connection.
 - **Bounded queue per stream** (64). Identical wake-ups are queued once, so a hot key costs one slot, not one per write. A stream ends, rather than buffers, when more than `queue_size` distinct keys or signals arrive during one read (only an all-keys stream on a wide channel gets there). It still sends what that read found, so its cursor moves on, then says `behind`; the browser reconnects and catches up.
 - **Caps** open streams per process (500) and, when you pass `owner` (a user id, session, or client address, as text), per key and owner (5). Past a cap, `hub.sse` raises a `503` with `Retry-After: 30`. The per-owner cap counts one key at a time: an owner may hold 5 streams on *every* key it can name, up to the process cap. To bound one client's total, set `max_total_per_owner` (off by default). Without `owner`, a client is not counted at all and can hold every slot in a worker, so pass `owner` on public endpoints, and size the caps on the total rather than on the per-key number.
-- **Ends streams after 15 minutes.** A stream is authenticated once, when it opens; this bounds how long a revoked session keeps one. To end it sooner, call `hub.close(owner=...)` when you revoke.
+- **Ends streams after 15 minutes.** A stream is authenticated once, when it opens; this bounds how long a revoked session keeps one. To end it sooner, call `hub.close(owner=...)` when you revoke, or pass `revalidate=` to `hub.sse` and the stream asks about every `revalidate_seconds` (15) whether it may go on.
 - **Ends every stream on SIGTERM**, so a deploy doesn't wait out uvicorn's graceful-shutdown timeout. It chains onto the server's handler; with no handler installed (a plain script) the default action is left alone and ends the process as usual.
 - **Says goodbye before a planned close.** The last frame carries `retry:`, which `EventSource` applies by itself, and, with `end_event` set, a named event with the reason:
 
@@ -294,9 +297,10 @@ typing.live(room_id)  # ["ann", "bo"]: who has not lapsed, for the GET the page 
 | `max_age` | The stream reached `max_stream_seconds`. | 1000 | Reconnect now, with its cursor. |
 | `shutdown` | SIGTERM, or the lifespan ending. | 1000–5000, random | Reconnect after the delay. The jitter spreads a deploy's reconnects out. |
 | `behind` | The stream's queue filled. | 1000 | Reconnect and catch up from its cursor. |
-| `revoked` | `hub.close` ended it (an owner or key was revoked). | 1000 | Reconnect; the route's own auth check decides whether it is let in. |
+| `recheck` | Its `revalidate` failed `revalidate_failures` times in a row. | 1000–5000, random | Reconnect after the delay; the route's own auth check decides. |
+| `revoked` | `hub.close` ended it (an owner or key was revoked), or its `revalidate` said no. | 1000 | Reconnect; the route's own auth check decides whether it is let in. |
 
-There is no goodbye after `Event(final=True)`, since the application already said what it meant, or when `read` raised, since the stream's state is unknown and an abrupt close is the honest signal.
+There is no goodbye after `Event(final=True)`, since the application already said what it meant, or when `read` or `start` raised, since the stream's state is unknown and an abrupt close is the honest signal.
 
 ```js
 // EventSource: nothing to write. `retry` is applied automatically; the reason is there if you want it.
@@ -321,7 +325,8 @@ Everything is importable from `pg_sse`. Each name below has a short description;
 Hub(conninfo, channel, *, max_subscribers=500, max_per_owner=5, max_total_per_owner=None, queue_size=64,
     max_stream_seconds=900, ping_seconds=(15, 25), reread_seconds=60, json_default=None, end_event=None,
     handle_signals=True, listen_timeout=5.0, resync_spread=2.0, application_name="pg-sse-listener",
-    read_executor=None, on_error=None)
+    read_executor=None, on_error=None, log_owner=False, revalidate_seconds=15, revalidate_failures=3,
+    revalidate_timeout=10)
 ```
 
 One per channel per process.
@@ -342,7 +347,11 @@ One per channel per process.
 - `listen_timeout`: seconds `lifespan` waits for the first LISTEN before the app starts (`None`: do not wait). A finite number, 0 or more. It never fails startup.
 - `resync_spread`: after the listener connects or reconnects, every stream re-reads. Each waits a random 0 to this many seconds first, so a database that has just come back is not hit by every open stream at once (up to `max_subscribers` reads queued behind your thread pool or connection pool). A notification for the stream's key during the wait starts the resync early (an all-keys stream keeps its time: every notification reaches it, so on a busy channel the first one would end all their waits at once). Any read in the meantime that re-reads everything counts as the resync: every read of a `read(cursor)`, and a quiet re-read. A `read(cursor, wake)` woken by a `hub.wake` signal alone reads at once and still gets its resync at its time. A resync takes no queue slot, so it never ends a busy stream as behind. `0` reads at once. Pings and the periodic re-read are already jittered; this closes the one synchronised burst.
 - `read_executor`: a thread pool (`concurrent.futures.ThreadPoolExecutor`; a `ProcessPoolExecutor` or `InterpreterPoolExecutor` raises `ValueError`, since a read runs with the caller's context variables) for plain (not async) `read` and `start` functions. By default they share asyncio's thread pool (at most 32 threads, also used by everything else that calls `asyncio.to_thread`), so a burst of stream re-reads can starve other work. Give the streams their own bounded pool: `ThreadPoolExecutor(8, thread_name_prefix="sse-read")`. Async reads do not use it, and the hub never shuts it down.
-- `on_error`: `on_error(key, exc)`, called when a stream fails, after the failure is logged: `read` or `start` raised, or `read` returned something the hub could not send (not an `Event`, data `json.dumps` refuses, a tuple id). Use it to report to an error tracker. A plain function runs in asyncio's default pool (not `read_executor`, where in an outage it would wait behind the failing reads), and an `async def` one on the loop, each as its own task, so a slow tracker never holds the failed response open, its slot taken, or the loop; leaving `lifespan` waits up to 5 seconds for those still running, then cancels them. An exception either raises is logged and ignored. The stream still ends without a goodbye.
+- `on_error`: `on_error(key, exc)`, or `on_error(key, exc, info)` (a third positional parameter named `info`, or with no default) to also get the stream's `StreamInfo`: its `owner` and `age_seconds`, to tell whose stream failed. A function that takes neither raises `TypeError` when the hub is made. The signature is what `inspect.signature` reports, which follows `functools.wraps`, so a decorated three-argument handler gets three. Called when a stream fails, after the failure is logged: `read` or `start` raised, or `revalidate` failed `revalidate_failures` times in a row, or `read` returned something the hub could not send (not an `Event`, data `json.dumps` refuses, a tuple id). Use it to report to an error tracker. A plain function runs in asyncio's default pool (not `read_executor`, where in an outage it would wait behind the failing reads), and an `async def` one on the loop, each as its own task, so a slow tracker never holds the failed response open, its slot taken, or the loop; leaving `lifespan` waits up to 5 seconds for those still running, then cancels them. An exception either raises is logged and ignored. A failed `read` or `start` ends the stream without a goodbye. A `revalidate` that failed `revalidate_failures` times in a row ends it with the goodbye `recheck`.
+- `log_owner`: whether the log line for a failed stream names its owner (default `False`: an owner may be a session token or an address; `True` or `False` only, `TypeError` otherwise). `on_error` receives it in `info` either way.
+- `revalidate_seconds`: about how long a stream waits between two runs of its `revalidate` (see `hub.stream`; jittered by a quarter either way, like the pings), and so, with the time the check takes, how long a revoked session can keep a stream that `hub.close` did not end. Greater than 0 and finite.
+- `revalidate_timeout`: how long one run may take before it counts as a failure (default 10 seconds). Greater than 0 and finite.
+- `revalidate_failures`: how many runs of a stream's `revalidate` in a row must fail (raise, or run over `revalidate_timeout`) to end the stream with `recheck` (default 3; 1 ends it at the first failure; `None` never ends it, so a failing check only warns and is counted in `revalidate_errors_total`). Fail-closed is the default because a check that raises exactly when a session is gone (a lookup that finds nothing) would otherwise leave a revoked session its stream, with a warning as the only sign. The cost: an outage of the session store ends every stream after about three intervals, and the route that has to let each client back in probably needs the same store and fails. A bare `EventSource` does not retry a non-200 and stops until the page reloads; a client that retries on its own comes back once the store does. If you cannot have that, pass `None` and let `max_stream_seconds` bound the rest. The runs before the last warn at most once a minute for the hub.
 - `application_name`: what `pg_stat_activity` shows for the listener's connection, to tell several services' listeners apart.
 
 ### `hub.lifespan`
@@ -352,7 +361,8 @@ One per channel per process.
 ### `hub.stream`
 
 ```python
-hub.stream(key, read, *, cursor=None, start=None, owner=None, end_event=None, max_stream_seconds=None) -> AsyncIterator[str]
+hub.stream(key, read, *, cursor=None, start=None, owner=None, end_event=None, max_stream_seconds=None,
+           revalidate=None) -> AsyncIterator[str]
 ```
 
 The primary API: an async iterator of encoded SSE frames, for any framework. Raises `TooManySubscribers` when it is called, before any response exists: the stream takes its slot then, not when its first frame is read, and gives it back when it ends, or, for a response that was never sent (the route raised after making it, or the client left before the body started), when it is garbage-collected (at once on CPython) and 30 seconds after it was made at the latest. A server reads a stream the moment it sends the response, so one read after that ends at once, with no goodbye.
@@ -364,15 +374,32 @@ The primary API: an async iterator of encoded SSE frames, for any framework. Rai
 - `owner`: a user id or session, for the per-owner caps and `hub.close(owner=...)`. A `str`, or an `int`, which is turned into text, so `hub.close(owner=7)` and `hub.close(owner="7")` find the same streams. Any other type (a `UUID`, a `bool`) raises `TypeError`: pass `str(owner)`.
 - `end_event`: overrides the hub's.
 - `max_stream_seconds`: overrides the hub's age limit for this stream, so a visitor's stream can expire sooner than a dashboard session's. Must be greater than 0; `math.inf` for no limit.
+- `revalidate`: `await revalidate()` says whether the stream may go on, so a removed member or a signed-out session loses its stream without a `hub.close` at every place that revokes. A falsy answer, `None` too, ends it with the goodbye `revoked`, as `hub.close` does: return `False` for a session that is gone, and raise only when the check itself could not be made. An auth helper that raises to deny (an `HTTPException(403)`) is a failure, not a no: catch it and return `False`. (An `async def` that forgot its `return` ends every stream with `revoked` about every 15 seconds, which shows at once.) It must be async, an `async def` or a `functools.partial` of one (use `partial(is_member, user_id)` where you would write a lambda), not a plain function or a lambda: it runs on the event loop for every open stream, where a blocking call would stall them all and nothing could interrupt it. It is checked when the stream is made, with whether it takes arguments: `TypeError` otherwise. It runs about every `revalidate_seconds` (15 by default, jittered), on a clock of its own: the first time about that long after the stream is first read, since the route has just checked, and not tied to pings or reads, so a stream in a long read, or stuck in `start`, is ended too. It runs in a task of its own, with the context variables of the task that reads the stream, so make it a cached lookup, and close over the session or user id: it is not given the request. If it raises or runs over `revalidate_timeout` (10 seconds), that is a failure: it warns, at most once a minute for the hub, and is counted in `HubStats.revalidate_errors_total`; alert on that, since a check that always fails leaves the stream unchecked until `revalidate_failures` (3) in a row end it with the goodbye `recheck`. That end is counted in `ended_total.recheck`, given to `on_error` and, at most once a minute for the hub, logged; the client reconnects after a jittered 1 to 5 seconds and the route's own check decides. Its type is `pg_sse.Revalidate`.
+
+**A `revalidate` on a sync driver.** `revalidate` must be async, and a plain function is a `TypeError`: it runs on the event loop for every open stream, and a blocking call in it would stall them all. If your session lookup is a plain database call, wrap it in a thread yourself and hand `hub.sse` a `partial`:
+
+```python
+from functools import partial
+from starlette.concurrency import run_in_threadpool
+
+
+async def session_is_valid(token: str) -> bool:
+    return await run_in_threadpool(db.session_is_valid, token)  # False for a session that is gone
+
+
+hub.sse(room, read=..., owner=str(user_id), revalidate=partial(session_is_valid, token))
+```
+
+A thread cannot be interrupted, so `revalidate_timeout` stops waiting for it but not the thread: a database that hangs holds one thread per stream in Starlette's pool (40 by default), shared with every sync route. Prefer an async driver, or a lookup answered from a cache, so the check is quick.
 
 ### `hub.sse`
 
 ```python
 hub.sse(key, read, *, cursor=None, start=None, owner=None, end_event=None, max_stream_seconds=None,
-        headers=None, refuse_with=None)
+        revalidate=None, headers=None, refuse_with=None)
 ```
 
-`stream` as a Starlette/FastAPI response (needs the `starlette` extra). Past a cap it raises a 503 with `Retry-After: 30`; `refuse_with(err)` returns your own exception to raise instead, e.g. one your error tracker ignores. `headers` are added to the response.
+`stream` as a Starlette/FastAPI response (needs the `starlette` extra). Past a cap it raises a 503 with `Retry-After: 30`; `refuse_with(err)` returns your own exception to raise instead, e.g. one your error tracker ignores. `headers` are added to the response. For FastAPI's OpenAPI document pass `responses=pg_sse.event_stream_responses()` and `response_class=StreamingResponse` to the route.
 
 ### `Event`
 
@@ -399,7 +426,7 @@ Why `read` runs, for a `read(cursor, wake)`. See [Signal streams](#signal-stream
 hub.close(*, owner=None, key=None)
 ```
 
-Ends this process's streams opened with `owner` and/or on `key`, so a removed operator, a blocked visitor or a revoked session does not keep a stream for up to `max_stream_seconds`. That includes a stream that `hub.sse` has created but whose first frame has not been read yet, a stream whose `read` is running (an `async def` read is cancelled, so the goodbye goes out at once; a plain one runs on in its thread and what it found is not sent), and a stream partway through sending a batch (the rest is not sent). Each stream sends a goodbye with reason `revoked` and ends. At least one argument is required; `hub.close_all()` ends every stream. `owner` is a `str` or an `int`, as for `stream`; any other type raises `TypeError`.
+Ends this process's streams opened with `owner` and/or on `key`, so a removed operator, a blocked visitor or a revoked session does not keep a stream for up to `max_stream_seconds`. That includes a stream that `hub.sse` has created but whose first frame has not been read yet, a stream whose `read` is running (an `async def` read is cancelled, so the goodbye goes out at once; a plain one runs on in its thread and what it found is not sent), and a stream partway through sending a batch (the rest is not sent). Each stream sends a goodbye with reason `revoked` and ends. A stream given `revalidate` ends the same way without a call here, once the check says no. At least one argument is required; `hub.close_all()` ends every stream. `owner` is a `str` or an `int`, as for `stream`; any other type raises `TypeError`.
 
 - **When it acts.** Safe from any thread. Called on the event loop it takes effect before it returns; from another thread it is handed to the loop. It does nothing, silently, while the hub is not running, when there are no streams to end.
 - **Who it reaches.** A stream opened after the call (the user signed in again) is not ended with the old ones, even when the call came from another thread and reaches the loop later. A route that checked the session before the revoke but opens its stream after the call is not reached; `max_stream_seconds` bounds that window.
@@ -523,7 +550,7 @@ Signals per key that lapse unless renewed (typing, presence), announced with `hu
 
 ### `hub.stats`
 
-A frozen `HubStats`: `open_streams`, `refused_total`, `dropped_total`, `listener_connected`, `listener_reconnects_total`, `last_notification_at` (Unix time or `None`), `read_errors_total` (streams that failed, as `on_error` reports them) and `ended_total`, a frozen `EndedTotals` of goodbyes sent by reason: `max_age`, `shutdown`, `revoked` and `behind`. "Streams dropped for being slow" is `dropped_total`; `ended_total.behind` counts the ones that then said so, which leaves out a dropped stream that a close or shutdown reached first, or whose client left. A goodbye is counted once the client took it, so a stream whose client left, or that ended with a `final` event or a failure, is in none of them. `dataclasses.asdict(hub.stats())` gives all of it as a dict, `ended_total` as a nested one. The `_total` fields only grow, so a metrics exporter can read them on a timer and publish them as counters. They are per process and start at zero. pg-sse ships no exporter code, since people use different ones.
+A frozen `HubStats`: `open_streams`, `refused_total`, `dropped_total`, `listener_connected`, `listener_reconnects_total`, `last_notification_at` (Unix time or `None`), `read_errors_total` (streams that failed: `read` or `start` raised, or `read` returned something that could not be sent) and `revalidate_errors_total` (runs of a `revalidate` that raised or timed out; streams that `revalidate_failures` ended are in `ended_total.recheck`) and `ended_total`, a frozen `EndedTotals` of goodbyes sent by reason: `max_age`, `shutdown`, `revoked`, `behind` and `recheck`. "Streams dropped for being slow" is `dropped_total`; `ended_total.behind` counts the ones that then said so, which leaves out a dropped stream that a close or shutdown reached first, or whose client left. A goodbye is counted once the client took it, so a stream whose client left, or that ended with a `final` event or a failed `read` or `start`, is in none of them. `dataclasses.asdict(hub.stats())` gives all of it as a dict, `ended_total` as a nested one. The `_total` fields only grow, so a metrics exporter can read them on a timer and publish them as counters. They are per process and start at zero. pg-sse ships no exporter code, since people use different ones.
 
 ### `hub.streams`
 
@@ -548,9 +575,9 @@ The low-level queue under `stream`, for a custom stream loop. `key` and `owner` 
 
 `await subscription.wait(timeout)` returns everything queued once there is anything, or `None` on timeout. An item is `("notify", key)` for a database notification, `("wake", key, signal)` for a `hub.wake`, or `("marker", name)`, which means re-read everything. Once `subscription.ended` is true the stream is over: it fell behind, the hub is shutting down (`hub.closing`), or `hub.close` ended it. After a listener connect or reconnect the resync marker arrives at once: `resync_spread` applies only to `hub.stream` and `hub.sse`, so a custom loop that serves many streams should add its own jitter.
 
-### `Read` and `Start`
+### `Read`, `Start`, `Revalidate` and `ErrorHandler`
 
-The types of `read` and `start`: `Read` is `Callable[..., Iterable[Event] | Awaitable[Iterable[Event]]]` and `Start` is `Callable[[], Any]`. Use them to annotate a helper that wraps `hub.sse`:
+The types of `read`, `start`, `revalidate` and `on_error`: `Read` is `Callable[..., Iterable[Event] | Awaitable[Iterable[Event]]]`, and `Start` is `Callable[[], Any]`, `Revalidate` is `Callable[[], Awaitable[Any]]`, and `ErrorHandler` is a function of `(key, exc)` or `(key, exc, info)`. Use them to annotate a helper that wraps `hub.sse`:
 
 ```python
 from pg_sse import Hub, Read, Start
@@ -559,6 +586,14 @@ from pg_sse import Hub, Read, Start
 def room_stream(hub: Hub, room_id: int, read: Read, start: Start):
     return hub.sse(str(room_id), read=read, start=start)
 ```
+
+### `event_stream_responses`
+
+```python
+event_stream_responses(status_code=200, description=None) -> dict
+```
+
+FastAPI's `responses=` for a route that returns `hub.sse(...)`: `text/event-stream` and its `Cache-Control` and `X-Accel-Buffering` headers, under `status_code` for a route that sets another one, and with `description` if given (otherwise the route's `response_description` applies to its own status code). Pass `response_class=StreamingResponse` too, or FastAPI also lists `application/json`. It returns a new dict each time, so add to it freely.
 
 ### `trigger_sql`
 
@@ -656,14 +691,14 @@ The exception is `hub.wake`: it reaches only the streams of the process that cal
 
 ## Logging
 
-pg-sse logs to the standard-library logger named `pg_sse` and adds no handlers, so configure it like any other. At `WARNING` it logs a stream refused at a cap or during shutdown (back-pressure, not a fault) and the listener losing its connection (with the traceback and the retry delay). It also warns, at most once a minute, about a client cursor with a line break or NUL (the stream starts from now) and about an id longer than an `IntCursor`'s `max_digits`. At `ERROR` it logs, with a traceback, a stream whose `read` or `start` raised or returned something other than `Event` items (that stream ends and the client reconnects), and an `on_error` callback that failed.
+pg-sse logs to the standard-library logger named `pg_sse` and adds no handlers, so configure it like any other. At `WARNING` it logs a stream refused at a cap or during shutdown (back-pressure, not a fault), the listener losing its connection (with the traceback and the retry delay), and, at most once a minute per hub, a `revalidate` that failed without ending its stream. It also warns, at most once a minute, about a client cursor with a line break or NUL (the stream starts from now) and about an id longer than an `IntCursor`'s `max_digits`. At `ERROR` it logs, with a traceback, a stream whose `read` or `start` raised or returned something other than `Event` items (that stream ends and the client reconnects), naming its key, its owner (if `log_owner=True`) and age; one that a failing `revalidate` ended is logged the same way at most once a minute per hub, and a failed run that ends nothing is a WARNING. It also logs an `on_error` callback that failed.
 
 ## Limits
 
 - **LISTEN needs a direct connection.** Behind a transaction-mode pooler (PgBouncer in transaction mode, the pooled connection strings Supabase and Neon give out) LISTEN succeeds and nothing ever arrives; streams then update only on the re-read. Give the hub the direct URL; your queries can still use the pooler.
 - **The cursor sees new rows, not updates.** If a stream must show edits, have `read` return the current state alongside new rows, or use a cursor that moves on update (a version column with `order_column`). If it does not need to show them, stop them from notifying: `trigger_sql(..., on=("insert",))`, or `update_of=(...)` to wake only for edits of the columns a reader shows. Otherwise every update wakes every reader of that key for a read that returns nothing. A write the trigger leaves out never wakes a stream; the stream finds it on its next re-read.
 - **A key is text.** `hub.stream`, `hub.sse`, `hub.subscribe` and `hub.wake` raise a `TypeError` for a key that is not a `str`, because a notification carries the key column as text and an int would subscribe and never wake. Pass `str(room_id)`.
-- **Sync reads run in a thread pool.** A plain-function `read` or `start` runs in asyncio's default executor (`min(32, cpu + 4)` threads) unless you pass `read_executor`, and under Starlette other sync routes share anyio's pool of 40. Hundreds of streams re-reading at once queue behind it. Prefer async `read` and `start` on an `psycopg_pool.AsyncConnectionPool`; see [examples/chat.py](https://github.com/sandhusanthakumar/pg-sse/blob/main/examples/chat.py). Use `functools.partial(read_after, room)` rather than a lambda to keep an async function off the pool.
+- **Sync reads run in a thread pool.** A plain-function `read` or `start` runs in asyncio's default executor (`min(32, cpu + 4)` threads) unless you pass `read_executor`, and under Starlette other sync routes share anyio's pool of 40. Hundreds of streams re-reading at once queue behind it. Prefer async `read` and `start` on an `psycopg_pool.AsyncConnectionPool`; see [examples/chat.py](https://github.com/sansanth/pg-sse/blob/main/examples/chat.py). Use `functools.partial(read_after, room)` rather than a lambda to keep an async function off the pool.
 - **`order_column` serialises inserts per key.** The ordering trigger takes `pg_advisory_xact_lock` on the key and holds it until the transaction ends, so every other insert to that key waits for the whole transaction. Two transactions inserting into keys in opposite order can deadlock, and Postgres aborts one of them. Keep the transaction that inserts short, or skip `order_column` and tolerate a late id arriving on the next re-read. The lock is `pg_advisory_xact_lock(hashtext(channel), hashtext(key))`; advisory locks share one namespace per database, so an application taking the same two-int lock would serialise against these inserts, and since `hashtext` is 32-bit two different keys can collide and briefly wait on each other (a delay, never wrong ids).
 - **Ephemeral state is per process.** `hub.ephemeral` keeps its signals in memory: with several workers a signal set on one is invisible to the streams on the others, and a restart loses it. That costs nothing for typing or presence; anything that must be seen everywhere belongs in a table with a trigger.
 - **Per process.** Each worker runs its own listener, which works, but the caps are per process.
@@ -674,7 +709,7 @@ pg-sse logs to the standard-library logger named `pg_sse` and adds no handlers, 
 
 ## For AI coding agents
 
-If you are generating code with this library, follow these rules. [llms.txt](https://github.com/sandhusanthakumar/pg-sse/blob/main/llms.txt) carries the same rules in a form meant to be fed to an agent.
+If you are generating code with this library, follow these rules. [llms.txt](https://github.com/sansanth/pg-sse/blob/main/llms.txt) carries the same rules in a form meant to be fed to an agent.
 
 1. Run `trigger_sql(table, key_column, channel, order_column="id")` once in a migration. Do not call `pg_notify` from application code, and do not put row data in a notification.
 2. Give `Hub` a **direct** database URL (not a pooled / PgBouncer / Supabase port 6543 / Neon `-pooler` URL).
@@ -694,7 +729,7 @@ If you are generating code with this library, follow these rules. [llms.txt](htt
 
 ## Development
 
-See [CONTRIBUTING.md](https://github.com/sandhusanthakumar/pg-sse/blob/main/CONTRIBUTING.md). In short:
+See [CONTRIBUTING.md](https://github.com/sansanth/pg-sse/blob/main/CONTRIBUTING.md). In short:
 
 ```sh
 uv sync

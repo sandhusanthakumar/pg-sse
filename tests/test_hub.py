@@ -4,6 +4,7 @@ import contextlib
 import dataclasses
 import os
 import signal
+import sys
 import threading
 import time
 import uuid
@@ -20,7 +21,7 @@ from starlette.exceptions import HTTPException
 
 from pg_sse import EndedTotals, Hub, HubStats, TooManySubscribers, Wake, distinct
 from pg_sse import _hub as hub_module
-from pg_sse._hub import CLOSING, DROPPED, RESYNC, REVOKED, _accepts_wake, _wake_from
+from pg_sse._hub import CLOSING, DROPPED, RESYNC, REVOKED, _accepts_info, _accepts_wake, _wake_from
 
 pytestmark = pytest.mark.anyio
 
@@ -542,6 +543,14 @@ async def test_a_dsn_function_that_raises_is_retried_like_a_failed_connect(db, m
         ({"resync_spread": -1}, "resync_spread"),
         ({"resync_spread": float("nan")}, "resync_spread"),
         ({"resync_spread": float("inf")}, "resync_spread"),
+        ({"revalidate_seconds": 0}, "revalidate_seconds"),
+        ({"revalidate_seconds": float("nan")}, "revalidate_seconds"),
+        ({"revalidate_failures": 0}, "revalidate_failures"),
+        ({"revalidate_timeout": 0}, "revalidate_timeout"),
+        ({"revalidate_timeout": float("nan")}, "revalidate_timeout"),
+        ({"revalidate_failures": 2.5}, "revalidate_failures"),
+        ({"revalidate_failures": float("nan")}, "revalidate_failures"),
+        ({"revalidate_failures": True}, "revalidate_failures"),
         ({"application_name": ""}, "application_name"),
         ({"max_total_per_owner": 0}, "max_total_per_owner"),
         ({"queue_size": 0}, "queue_size"),
@@ -800,6 +809,180 @@ def test_a_read_without_a_signature_is_assumed_to_take_the_cursor_only():
         assert _accepts_wake(_two) is False
 
 
+def _report_one(key, exc):
+    pass
+
+
+def _report_info(key, exc, info):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("on_error", "wants_info"),
+    [
+        (_report_one, False),
+        (_report_info, True),
+        (lambda key, exc: None, False),
+        (lambda key, exc, info: None, True),
+        (partial(lambda tracker, key, exc, info: None, "t"), True),
+        # A defaulted third parameter of another name is the app's own, as for a read's second.
+        (lambda key, exc, tags=None: None, False),
+        (lambda key, exc, info=None: None, True),
+        (lambda key, exc, *, info: None, False),
+        (lambda *args: None, False),
+    ],
+)
+def test_an_on_error_that_takes_a_third_argument_gets_the_stream_info(on_error, wants_info):
+    assert _accepts_info(on_error) is wants_info
+
+
+def test_an_on_error_without_a_signature_is_assumed_to_take_key_and_error():
+    with mock.patch.object(hub_module.inspect, "signature", side_effect=ValueError):
+        assert _accepts_info(_report_info) is False
+
+
+@pytest.mark.parametrize("log_owner", ["false", 1, None])
+def test_log_owner_must_be_a_bool(log_owner):
+    with pytest.raises(TypeError, match="log_owner must be True or False"):
+        Hub("postgresql://x", "c", log_owner=log_owner)
+
+
+@pytest.mark.parametrize(
+    "on_error",
+    [lambda key: None, lambda key, exc, *, info: None, lambda key, exc, info, extra: None, "sentry"],
+)
+def test_an_on_error_that_takes_neither_two_nor_three_arguments_is_refused_at_once(on_error):
+    with pytest.raises(TypeError, match="on_error must be a function of"):
+        Hub("postgresql://x", "c", on_error=on_error)
+
+
+@pytest.mark.parametrize("on_error", [lambda key, exc: None, lambda key, exc, info: None, lambda *args: None, print])
+def test_an_on_error_of_two_or_three_arguments_is_accepted(on_error):
+    assert Hub("postgresql://x", "c", on_error=on_error).on_error is on_error
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 14), reason="annotations are evaluated when the function is defined before 3.14"
+)
+def test_a_callback_annotated_with_a_name_that_is_not_imported_still_has_its_parameters_read():
+    def report(key, exc, info: StreamInfoOnlyForTypeChecking): ...  # type: ignore[name-defined]  # noqa: F821
+
+    def read(after, wake: WakeOnlyForTypeChecking): ...  # type: ignore[name-defined]  # noqa: F821
+
+    assert hub_module._accepts_info(report) is True
+    assert hub_module._accepts_wake(read) is True
+    Hub("postgresql://x", "c", on_error=report)
+
+
+def test_an_on_error_without_a_signature_is_left_to_its_first_report():
+    with mock.patch.object(hub_module.inspect, "signature", side_effect=ValueError):
+        Hub("postgresql://x", "c", on_error=lambda key: None)
+
+
+def test_the_public_error_handler_alias_can_be_resolved_by_a_module_that_only_imports_it():
+    import typing
+
+    from pg_sse import ErrorHandler
+
+    def configure(handler):  # annotated as text, as with `from __future__ import annotations`
+        ...
+
+    configure.__annotations__ = {"handler": "ErrorHandler | None"}
+    # No `StreamInfo` in these globals: the alias must carry its own, not a name for the consumer to find.
+    typing.get_type_hints(configure, globalns={"ErrorHandler": ErrorHandler})
+
+
+def test_revalidate_failures_may_be_none_for_no_limit():
+    assert Hub("postgresql://x", "c", revalidate_failures=None).revalidate_failures is None
+
+
+async def _fine():
+    return True
+
+
+async def _fine_for(user):
+    return True
+
+
+class _AsyncCall:
+    async def __call__(self):
+        return True
+
+
+@pytest.mark.parametrize("revalidate", [_fine, partial(_fine_for, 7), _AsyncCall()])
+def test_an_async_revalidate_that_takes_no_arguments_is_accepted(revalidate):
+    hub_module._check_revalidate(revalidate)
+
+
+@pytest.mark.parametrize(
+    "revalidate",
+    [
+        lambda: True,  # plain: it would block the loop
+        lambda: _fine(),  # a lambda that returns a coroutine: the check cannot know, so use `partial(_fine)`
+        print,
+        _fine_for,  # needs an argument
+        "yes",
+        3,
+    ],
+)
+def test_a_revalidate_that_is_not_async_or_needs_arguments_is_refused(revalidate):
+    with pytest.raises(TypeError, match="revalidate must be an async function of no arguments"):
+        hub_module._check_revalidate(revalidate)
+
+
+def test_a_revalidate_without_a_signature_is_left_to_its_first_call():
+    with mock.patch.object(hub_module.inspect, "signature", side_effect=ValueError):
+        hub_module._check_revalidate(_fine_for)  # arguments are not checked; it still has to be async
+        with pytest.raises(TypeError, match="async"):
+            hub_module._check_revalidate(lambda: True)
+
+
+def test_event_stream_responses_document_a_text_event_stream_and_its_headers():
+    from fastapi import FastAPI
+    from fastapi.responses import StreamingResponse
+
+    from pg_sse import event_stream_responses
+
+    app = FastAPI()
+
+    @app.get("/plain", responses=event_stream_responses())
+    async def plain() -> None: ...
+
+    @app.get("/stream", responses=event_stream_responses(), response_class=StreamingResponse)
+    async def stream() -> None: ...
+
+    @app.get("/made", status_code=201, responses=event_stream_responses(201), response_class=StreamingResponse)
+    async def made() -> None: ...
+
+    @app.get("/said", responses=event_stream_responses(), response_class=StreamingResponse, response_description="Live")
+    async def said() -> None: ...
+
+    @app.get(
+        "/described", responses=event_stream_responses(description="Room updates"), response_class=StreamingResponse
+    )
+    async def described() -> None: ...
+
+    paths = app.openapi()["paths"]
+    ok = paths["/stream"]["get"]["responses"]["200"]
+    assert list(ok["content"]) == ["text/event-stream"]
+    assert set(ok["headers"]) == set(hub_module.STREAM_HEADERS)
+    assert list(paths["/made"]["get"]["responses"]["201"]["content"]) == ["text/event-stream"]
+    assert paths["/said"]["get"]["responses"]["200"]["description"] == "Live"  # the route's own is not overwritten
+    assert paths["/described"]["get"]["responses"]["200"]["description"] == "Room updates"
+    # Without `response_class`, FastAPI adds its JSON default beside it: the docs say to pass both.
+    assert set(paths["/plain"]["get"]["responses"]["200"]["content"]) == {"application/json", "text/event-stream"}
+
+
+def test_event_stream_responses_is_a_new_dict_each_time():
+    from pg_sse import event_stream_responses
+
+    first = event_stream_responses()
+    first[200]["headers"]["X-New"] = {}
+    first[404] = {"description": "No such room"}
+    assert "X-New" not in event_stream_responses()[200]["headers"]
+    assert list(event_stream_responses()) == [200]
+
+
 async def test_the_listener_connects_under_the_application_name_it_is_given(db):
     name = f"svc-{db.channel}"
     hub = make_hub(db, application_name=name)
@@ -822,6 +1005,20 @@ async def test_close_ends_the_streams_of_one_owner_and_frees_their_slots(db):
             hub.unsubscribe(subscription)  # as each stream does once it has said goodbye
         assert hub.stats().open_streams == 1
         assert hub.subscribe("a", owner="ann")  # revoking is not a ban: the route decides whether this one is let in
+
+
+async def test_a_recheck_not_yet_said_is_replaced_by_a_revoke_but_not_by_a_drop(db):
+    hub = make_hub(db)
+    async with hub.lifespan():
+        # A hub stream stays known until its goodbye is said, which is when a later end can still replace its marker.
+        rechecked = hub._subscribe("a", "ann", hub_stream=True)
+        dropped = hub._subscribe("b", "bob", hub_stream=True)
+        hub._end_stream(rechecked, hub_module.RECHECK)
+        hub._end_stream(dropped, hub_module.RECHECK)
+        hub.close(owner="ann")
+        await until(lambda: rechecked.end_marker == REVOKED)
+        dropped._close(DROPPED)
+        assert dropped.end_marker == hub_module.RECHECK
 
 
 async def test_close_by_key_ends_that_keys_streams_and_not_the_all_keys_streams(db):
