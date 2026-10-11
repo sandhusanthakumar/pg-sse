@@ -79,6 +79,8 @@ source.onmessage = (e) => render(JSON.parse(e.data));
 
 `EventSource` reconnects by itself and sends `Last-Event-ID`; the stream catches up from there. The header is client input, so `IntCursor` lets only digits through, and the route starts anything else from now, as if there were no header. Not a 422: `EventSource` stops for good on any response that is not a 200, so one stale or malformed id (an old cursor format after a deploy) would end live updates in that tab. Do not hand-roll the check with `str.isdigit()`: it is true for `²`, which `int()` then rejects, so a client could turn the route into a 500.
 
+When `EventSource` is not enough (to send an `Authorization` header, to see why a request was refused, or to retry a 503 after its `Retry-After` instead of stopping for good), use [pg-sse-client](https://github.com/sansanth/pg-sse-client): `npm install pg-sse-client`. The `pg-sse` package on npm is unrelated.
+
 A full runnable app, with async reads on a connection pool and a browser page: [examples/chat.py](https://github.com/sansanth/pg-sse/blob/main/examples/chat.py).
 
 **Notify only for the writes a reader can see.** By default every insert, update and delete notifies. A cursor-based `read` only finds new rows, so on a table with edits, read receipts or soft deletes, each update would wake every reader of that key for a read that returns nothing. Say which writes matter:
@@ -314,6 +316,8 @@ if (event.event === "end") {
   scheduleReconnect(event.retry ?? 1_000);
 }
 ```
+
+[pg-sse-client](https://github.com/sansanth/pg-sse-client) does this for you: it reconnects after the `retry:` and passes the reason to `onEnd`.
 
 ## API
 
@@ -709,23 +713,7 @@ pg-sse logs to the standard-library logger named `pg_sse` and adds no handlers, 
 
 ## For AI coding agents
 
-If you are generating code with this library, follow these rules. [llms.txt](https://github.com/sansanth/pg-sse/blob/main/llms.txt) carries the same rules in a form meant to be fed to an agent.
-
-1. Run `trigger_sql(table, key_column, channel, order_column="id")` once in a migration. Do not call `pg_notify` from application code, and do not put row data in a notification.
-2. Give `Hub` a **direct** database URL (not a pooled / PgBouncer / Supabase port 6543 / Neon `-pooler` URL).
-3. Register the hub with `FastAPI(lifespan=hub.lifespan)`, or `async with hub.lifespan():` inside an existing lifespan.
-4. Call `hub.sse(...)` (Starlette/FastAPI) or `hub.stream(...)` (any framework; catch `TooManySubscribers`) from an `async def` route, after any 404 or permission check.
-5. `read(after)` returns `pg_sse.Event` items **after** the cursor, oldest first, each with `id` set. Use `WHERE id > %s ORDER BY id LIMIT n`.
-6. Parse `Last-Event-ID` before passing it as `cursor`; it is client input. A module-level `IntCursor()`'s `parse_one(header)` returns the int or `None` (start from now; a 422 stops `EventSource` for good); never `str.isdigit()` then `int()`.
-7. Pass `start=` (the current max id) when the stream should start from now. Do not compute it before calling `hub.sse`: that reintroduces a gap.
-8. Prefer async `read` and `start` on a connection pool; plain functions run in a limited thread pool.
-9. In the browser use `EventSource`; it resumes with `Last-Event-ID` by itself.
-10. `read(cursor, wake)` is optional: use it only when the stream must tell the client *what kind* of change happened (see Signal streams). A stream that sends rows keeps `read(cursor)`.
-11. Use `hub.ephemeral(name, ttl=...)` for ephemeral per-key state (typing, presence): `set(key, who)` on every keystroke or heartbeat, `live(key)` to answer the refetch. For other changes that are not database writes, `hub.wake(key, signal=..., all_keys=False)`; the default also wakes the all-keys streams.
-12. Set `Hub(end_event="end")` when the client is not `EventSource`, so it can read the reason and the retry before a planned close.
-13. The key is always a `str`: pass `str(room_id)` for an integer or UUID column. Anything else raises a `TypeError`.
-14. On a table with edits, read receipts or soft deletes, use `trigger_sql(..., on=("insert",))` so only new rows wake readers.
-15. In an Alembic migration, `op.execute(trigger_sql(...))` in `upgrade` and `op.execute(drop_trigger_sql(...))` in `downgrade`, on the psycopg driver (asyncpg rejects the multi-statement SQL).
+[llms.txt](https://github.com/sansanth/pg-sse/blob/main/llms.txt) has the rules for generating code with this library, in a form meant to be fed to an agent. Runnable examples are in [examples/](https://github.com/sansanth/pg-sse/tree/main/examples): a chat room with async reads on a connection pool, and an inbox with a typing indicator built on signal streams.
 
 ## Development
 
