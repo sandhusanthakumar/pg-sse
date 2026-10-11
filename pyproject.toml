@@ -36,6 +36,7 @@ fastapi = ["fastapi>=0.110"]
 Homepage = "https://github.com/sansanth/pg-sse"
 Issues = "https://github.com/sansanth/pg-sse/issues"
 Changelog = "https://github.com/sansanth/pg-sse/blob/main/CHANGELOG.md"
+"JavaScript client" = "https://github.com/sansanth/pg-sse-client"
 
 [dependency-groups]
 dev = [
