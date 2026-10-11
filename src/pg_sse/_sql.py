@@ -1,7 +1,7 @@
 import re
 from collections.abc import Iterable
 
-_IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
+_IDENTIFIER = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 _OPERATIONS = ("insert", "update", "delete")
 
 
@@ -155,7 +155,7 @@ def _parse(table: str, key_column: str, channel: str | None, order_column: str |
 
 
 def _check(identifier: str) -> None:
-    if not _IDENTIFIER.match(identifier):
+    if not _IDENTIFIER.fullmatch(identifier):
         raise ValueError(f"pg_sse: {identifier!r} is not a plain lower-case identifier (a-z, 0-9, _; at most 63 bytes)")
 
 

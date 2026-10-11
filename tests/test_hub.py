@@ -1,19 +1,26 @@
 import asyncio
+import concurrent.futures
 import contextlib
+import dataclasses
 import os
 import signal
 import threading
 import time
+import uuid
+from concurrent.futures import ProcessPoolExecutor
+from decimal import Decimal
+from fractions import Fraction
 from functools import partial
 from unittest import mock
 
 import psycopg
 import pytest
 from helpers import execute, make_hub, terminate_listener, until
+from starlette.exceptions import HTTPException
 
-from pg_sse import Hub, HubStats, TooManySubscribers, Wake
+from pg_sse import EndedTotals, Hub, HubStats, TooManySubscribers, Wake, distinct
 from pg_sse import _hub as hub_module
-from pg_sse._hub import CLOSING, DROPPED, RESYNC, _accepts_wake, _wake_from
+from pg_sse._hub import CLOSING, DROPPED, RESYNC, REVOKED, _accepts_wake, _wake_from
 
 pytestmark = pytest.mark.anyio
 
@@ -41,7 +48,7 @@ async def test_a_burst_is_one_wake_up(db):
         for _ in range(3):
             notify(db, "a")
         notify(db, "b")  # notifications arrive in order: once b is queued, all three a's have been offered
-        await until(lambda: every_key.queue.qsize() == 2)
+        await until(lambda: len(every_key._items) == 2)
         assert await subscription.wait(1) == [("notify", "a")]  # the repeats were not queued again
         assert await every_key.wait(1) == [("notify", "a"), ("notify", "b")]
 
@@ -52,11 +59,11 @@ async def test_identical_wake_ups_do_not_fill_the_queue(db):
         subscription = hub.subscribe("a")
         for _ in range(100):
             hub.wake("a")
-        await until(lambda: subscription.queue.qsize() == 1)
+        await until(lambda: len(subscription._items) == 1)
         await asyncio.sleep(0.05)  # the rest of the 100 have been dispatched too
         assert not subscription.ended
         assert await subscription.wait(1) == [("wake", "a", "wake")]
-        assert subscription.queue.empty()
+        assert not subscription._items
         hub.wake("a")  # what was read is no longer pending: the next one is queued again
         assert await subscription.wait(1) == [("wake", "a", "wake")]
 
@@ -107,7 +114,7 @@ async def test_every_stream_re_reads_after_the_listener_reconnects(db):
         assert await subscription.wait(3) == [("notify", "a")]
 
 
-async def test_the_listener_checks_a_quiet_connection(db, monkeypatch):
+async def test_a_quiet_connection_still_delivers_a_notification(db, monkeypatch):
     monkeypatch.setattr(hub_module, "_KEEPALIVE_QUERY_SECONDS", 0.0)
     hub = make_hub(db)
     async with hub.lifespan():
@@ -194,7 +201,7 @@ async def test_close_all_ends_every_stream_and_refuses_new_ones(db):
         subscription.close()  # closing twice is harmless
         hub.wake("a")  # and an ended stream takes nothing more
         await asyncio.sleep(0.05)
-        assert subscription.queue.empty()
+        assert not subscription._items
         with pytest.raises(TooManySubscribers, match="shutting down"):
             hub.subscribe("a")
 
@@ -260,41 +267,57 @@ async def test_a_notification_is_offered_only_to_the_streams_it_reaches(db):
         same_room = [hub.subscribe("a"), hub.subscribe("a")]
         every_room = hub.subscribe(None)
         with mock.patch.object(hub_module.Subscription, "offer", autospec=True, return_value=True) as offer:
-            hub._dispatch(("notify", "a"), "a")
+            hub._notify("a")
             assert {call.args[0] for call in offer.call_args_list} == {*same_room, every_room}
             offer.reset_mock()
             hub._dispatch(("wake", "a", "typing"), "a", all_keys=False)
             assert {call.args[0] for call in offer.call_args_list} == set(same_room)
             offer.reset_mock()
-            hub._dispatch(("notify", "nobody"), "nobody")
+            hub._notify("nobody")
             assert {call.args[0] for call in offer.call_args_list} == {every_room}
-            offer.reset_mock()
-            hub._dispatch(("marker", RESYNC))  # no key: every stream
-            assert offer.call_count == 200 + 3
+        with mock.patch.object(hub_module.Subscription, "resync", autospec=True) as resync:
+            hub._resync()  # every stream; `hub.subscribe` queues get it at once
+            assert resync.call_count == 200 + 3
 
 
-async def test_the_fan_out_index_is_empty_however_a_subscription_ends(db):
+async def test_the_indexes_are_empty_however_a_subscription_ends(db):
     hub = make_hub(db, queue_size=1)
     async with hub.lifespan():
         await until(hub.listening.is_set)
-        first, second, dropped = hub.subscribe("a"), hub.subscribe("a"), hub.subscribe("b")
-        kept_all, unsubscribed_all = hub.subscribe(None), hub.subscribe(None)
+        first, second, dropped = hub.subscribe("a", "ann"), hub.subscribe("a", "ann"), hub.subscribe("b", "bob")
+        kept_all, unsubscribed_all = hub.subscribe(None, "cy"), hub.subscribe(None)
         hub.unsubscribe(first)
         assert hub._by_key["a"] == {second}  # the key stays while another stream watches it
+        assert hub._by_owner["ann"] == {second}
         hub.unsubscribe(second)
         hub.unsubscribe(second)  # twice is harmless
         assert set(hub._by_key) == {"b"}
+        assert set(hub._by_owner) == {"bob", "cy"}
         hub.unsubscribe(unsubscribed_all)
         assert hub._watching_all == {kept_all}
         hub._dispatch(("notify", "x"), "b", all_keys=False)
         hub._dispatch(("notify", "y"), "b", all_keys=False)  # a second distinct item overflows a queue of one
         assert dropped.ended
-        assert hub._by_key == {}
+        assert hub._by_key == {}  # a `hub.subscribe` queue is forgotten when it is dropped
+        assert set(hub._by_owner) == {"cy"}
         assert hub._watching_all == {kept_all}
-        hub.subscribe("c")
+        hub.subscribe("c", "dee")
     assert hub._subscriptions == set()  # leaving the lifespan forgets the rest
     assert hub._by_key == {}
+    assert hub._by_owner == {}
     assert hub._watching_all == set()
+
+
+async def test_a_closed_subscribe_queue_is_forgotten_at_once_even_if_never_unsubscribed(db):
+    hub = make_hub(db, max_per_owner=1)
+    async with hub.lifespan():
+        revoked = hub.subscribe("a", "ann")
+        hub.close(owner="ann")
+        hub.close(owner="ann")  # twice is harmless
+        assert revoked.ended
+        assert await revoked.wait(0.5) == [("marker", REVOKED)]  # its loop still learns why
+        assert hub.stats().open_streams == 0  # no read of the hub's is left to stop: its slot is free
+        assert hub.subscribe("a", "ann")
 
 
 async def test_a_wake_reaches_its_key_and_the_all_keys_streams_unless_told_not_to(db):
@@ -365,7 +388,7 @@ async def test_an_unreachable_database_keeps_retrying_until_stopped():
     assert not hub.listening.is_set()
 
 
-async def test_lifespan_waits_briefly_for_the_listener(db):
+async def test_lifespan_waits_for_the_listener(db):
     hub = make_hub(db)
     async with hub.lifespan():
         assert hub.listening.is_set()
@@ -500,7 +523,26 @@ async def test_a_dsn_function_that_raises_is_retried_like_a_failed_connect(db, m
         ({"channel": "x" * 64}, "channel"),
         ({"ping_seconds": (0, 1)}, "ping_seconds"),
         ({"ping_seconds": (2, 1)}, "ping_seconds"),
+        ({"ping_seconds": (float("nan"), 1)}, "ping_seconds"),
+        ({"ping_seconds": (1, float("nan"))}, "ping_seconds"),
+        ({"ping_seconds": (1, float("inf"))}, "ping_seconds"),
+        ({"ping_seconds": (1,)}, "ping_seconds"),
+        ({"ping_seconds": 15}, "ping_seconds"),
+        ({"listen_timeout": float("nan")}, "listen_timeout"),
+        ({"listen_timeout": -1}, "listen_timeout"),
+        ({"end_event": "end\nx"}, "line break"),
+        ({"end_event": ""}, "end_event"),
         ({"reread_seconds": 0}, "reread_seconds"),
+        ({"reread_seconds": float("nan")}, "reread_seconds"),
+        ({"reread_seconds": "60"}, "reread_seconds"),
+        ({"reread_seconds": True}, "reread_seconds"),  # an int, but not a duration
+        ({"reread_seconds": Decimal("sNaN")}, "reread_seconds"),  # float() raises for it
+        ({"reread_seconds": 10**400}, "reread_seconds"),  # too large for a float
+        ({"ping_seconds": ("1", 2)}, "ping_seconds"),
+        ({"resync_spread": -1}, "resync_spread"),
+        ({"resync_spread": float("nan")}, "resync_spread"),
+        ({"resync_spread": float("inf")}, "resync_spread"),
+        ({"application_name": ""}, "application_name"),
         ({"max_total_per_owner": 0}, "max_total_per_owner"),
         ({"queue_size": 0}, "queue_size"),
         ({"queue_size": -1}, "queue_size"),
@@ -509,6 +551,31 @@ async def test_a_dsn_function_that_raises_is_retried_like_a_failed_connect(db, m
 def test_bad_settings_are_refused(kwargs, message):
     with pytest.raises(ValueError, match=message):
         Hub("postgresql://x", **{"channel": "c", **kwargs})
+
+
+def test_a_process_pool_is_refused_as_the_read_executor():
+    with ProcessPoolExecutor(1) as pool, pytest.raises(ValueError, match="ThreadPoolExecutor"):
+        Hub("postgresql://x", "c", read_executor=pool)
+
+
+@pytest.mark.skipif(not hasattr(concurrent.futures, "InterpreterPoolExecutor"), reason="Python 3.14+")
+def test_an_interpreter_pool_is_refused_as_the_read_executor():
+    # A subclass of ThreadPoolExecutor whose workers cannot run a closure from this interpreter.
+    with concurrent.futures.InterpreterPoolExecutor(1) as pool, pytest.raises(ValueError, match="interpreters"):
+        Hub("postgresql://x", "c", read_executor=pool)
+
+
+def test_durations_of_any_real_number_type_are_kept_as_floats():
+    hub = Hub(
+        "postgresql://x",
+        "c",
+        max_stream_seconds=Decimal(600),  # e.g. from a settings loader
+        ping_seconds=(Fraction(1, 2), 1),
+        reread_seconds=Decimal("30.5"),
+        resync_spread=0,
+    )
+    assert (hub.max_stream_seconds, hub.ping_seconds, hub.reread_seconds, hub.resync_spread) == (600, (0.5, 1), 30.5, 0)
+    assert all(type(value) is float for value in (hub.max_stream_seconds, *hub.ping_seconds, hub.reread_seconds))
 
 
 async def test_sigterm_ends_open_streams_at_once_and_once_per_lifespan(db, restore_signals):
@@ -576,7 +643,7 @@ async def test_a_handler_installed_over_ours_is_left_alone(db, restore_signals):
 
 async def test_stats_count_streams_refusals_drops_and_the_listener(db):
     hub = make_hub(db, max_subscribers=2, queue_size=1)
-    assert hub.stats() == HubStats(0, 0, 0, False, 0, None)
+    assert hub.stats() == HubStats(0, 0, 0, False, 0, None, 0, EndedTotals())
     async with hub.lifespan():
         await until(hub.listening.is_set)
         subscription = hub.subscribe("a")
@@ -655,6 +722,20 @@ def test_a_wake_is_built_from_everything_that_arrived_together():
     assert not Wake(signals=frozenset({"typing"})).data_may_have_changed
 
 
+def test_a_wake_remembers_which_keys_each_signal_was_sent_for():
+    wake = _wake_from([("wake", "a", "typing"), ("wake", "b", "typing"), ("wake", "a", "presence"), ("notify", "c")])
+    assert wake.signal_keys == {"typing": frozenset({"a", "b"}), "presence": frozenset({"a"})}
+    assert wake.signals == frozenset(wake.signal_keys)
+    assert _wake_from([("notify", "a")]).signal_keys == {}
+
+
+def test_signal_keys_are_not_part_of_equality_or_the_hash():
+    found = _wake_from([("wake", "a", "typing")])
+    assert found == Wake(signals=frozenset({"typing"}))  # what a test would write
+    assert hash(found) == hash(Wake(signals=frozenset({"typing"})))
+    assert found != Wake(signals=frozenset({"presence"}))
+
+
 def _one(after):
     return []
 
@@ -717,3 +798,328 @@ def test_a_read_that_takes_a_second_argument_gets_a_wake(read, wants_wake):
 def test_a_read_without_a_signature_is_assumed_to_take_the_cursor_only():
     with mock.patch.object(hub_module.inspect, "signature", side_effect=ValueError):
         assert _accepts_wake(_two) is False
+
+
+async def test_the_listener_connects_under_the_application_name_it_is_given(db):
+    name = f"svc-{db.channel}"
+    hub = make_hub(db, application_name=name)
+    async with hub.lifespan():
+        await until(hub.listening.is_set)
+        rows = execute(db.dsn, "SELECT count(*) FROM pg_stat_activity WHERE application_name = %s", (name,))
+        assert rows == [(1,)]
+
+
+async def test_close_ends_the_streams_of_one_owner_and_frees_their_slots(db):
+    hub = make_hub(db)
+    async with hub.lifespan():
+        ann = [hub.subscribe("a", owner="ann"), hub.subscribe("b", owner="ann")]
+        bob = hub.subscribe("a", owner="bob")
+        hub.close(owner="ann")
+        await until(lambda: all(s.ended for s in ann))
+        assert await ann[0].wait(1) == [("marker", REVOKED)]
+        assert not bob.ended
+        for subscription in ann:
+            hub.unsubscribe(subscription)  # as each stream does once it has said goodbye
+        assert hub.stats().open_streams == 1
+        assert hub.subscribe("a", owner="ann")  # revoking is not a ban: the route decides whether this one is let in
+
+
+async def test_close_by_key_ends_that_keys_streams_and_not_the_all_keys_streams(db):
+    hub = make_hub(db)
+    async with hub.lifespan():
+        in_room = [hub.subscribe("room", owner="ann"), hub.subscribe("room")]
+        elsewhere, everything = hub.subscribe("other"), hub.subscribe(None)
+        hub.close(key="room")
+        await until(lambda: all(s.ended for s in in_room))
+        assert not elsewhere.ended
+        assert not everything.ended
+
+
+async def test_close_with_an_owner_and_a_key_ends_only_streams_that_match_both(db):
+    hub = make_hub(db)
+    async with hub.lifespan():
+        match = hub.subscribe("room", owner="ann")
+        wrong_key, wrong_owner = hub.subscribe("other", owner="ann"), hub.subscribe("room", owner="bob")
+        hub.close(owner="ann", key="room")
+        await until(lambda: match.ended)
+        assert not wrong_key.ended
+        assert not wrong_owner.ended
+
+
+async def test_close_on_the_event_loop_takes_effect_before_it_returns(db):
+    hub = make_hub(db)
+    async with hub.lifespan():
+        old = hub.subscribe("room", owner="ann")
+        hub.close(owner="ann", key="room")
+        assert old.ended
+        new = hub.subscribe("room", owner="ann")  # opened after the call: not ended with the old one
+        assert not new.ended
+
+
+async def test_close_works_from_a_plain_thread(db):
+    hub = make_hub(db)
+    async with hub.lifespan():
+        subscription = hub.subscribe("room", owner="ann")
+        thread = threading.Thread(target=lambda: hub.close(owner="ann"))
+        thread.start()
+        thread.join()
+        await until(lambda: subscription.ended)
+
+
+async def test_close_needs_something_to_match_and_a_text_key(db):
+    hub = make_hub(db)
+    with pytest.raises(ValueError, match="close_all"):
+        hub.close()
+    with pytest.raises(TypeError, match="key must be a str"):
+        hub.close(key=1)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match=r"owner must be a str, an int or None, got UUID; pass str\(owner\)"):
+        hub.close(owner=uuid.uuid4())  # type: ignore[arg-type]  # a stream opened with its text would never match
+    with pytest.raises(TypeError, match="got bool"):
+        hub.close(owner=True)
+
+
+async def test_a_stream_cannot_be_opened_with_an_owner_close_could_never_match(db):
+    hub = make_hub(db)
+    async with hub.lifespan():
+        with pytest.raises(TypeError, match="owner must be a str, an int or None"):
+            hub.subscribe("a", 7.0)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="owner must be a str, an int or None"):
+            hub.stream("a", read=lambda after: [], owner=b"7")  # type: ignore[arg-type]
+        assert hub.stats().open_streams == 0
+
+
+async def test_an_int_owner_is_text_so_close_finds_it_either_way(db):
+    hub = make_hub(db, max_per_owner=1)
+    async with hub.lifespan():
+        first = hub.subscribe("a", 7)
+        assert first.owner == "7"
+        with pytest.raises(TooManySubscribers):
+            hub.subscribe("a", "7")  # the same owner
+        hub.close(owner="7")
+        assert first.ended
+        hub.unsubscribe(first)
+        second = hub.subscribe("a", "7")
+        hub.close(owner=7)
+        assert second.ended
+
+
+async def test_leaving_the_lifespan_cancels_resyncs_still_held_back(db):
+    hub = make_hub(db, resync_spread=5)
+    async with hub.lifespan():
+        await until(hub.listening.is_set)
+        await asyncio.sleep(0)
+        subscription = hub.subscribe("a")
+        subscription.hub_stream = True
+        hub._resync()
+        timer = subscription.resync_timer
+        assert timer is not None
+    assert timer.cancelled()
+    assert subscription.resync_timer is None
+
+
+async def test_a_notification_ends_the_held_back_resync_of_its_key_but_not_of_the_all_keys_streams(db):
+    # Every notification reaches an all-keys stream: on a busy channel the first one would end all their waits at once.
+    hub = make_hub(db, resync_spread=5)
+    async with hub.lifespan():
+        await until(hub.listening.is_set)
+        await asyncio.sleep(0)
+        room, every_room = hub.subscribe("a"), hub.subscribe(None)
+        room.hub_stream = every_room.hub_stream = True
+        hub._resync()
+        hub._notify("a")
+        assert await room.wait(0.5) == [("notify", "a"), ("marker", RESYNC)]
+        assert await every_room.wait(0.5) == [("notify", "a")]
+        assert every_room.resync_timer is not None  # still waits its turn
+
+
+@pytest.mark.parametrize("by", ["notification", "timer"])
+async def test_a_resync_takes_no_queue_slot_so_it_never_drops_a_busy_stream(db, by):
+    hub = make_hub(db, resync_spread=5, queue_size=1)
+    async with hub.lifespan():
+        await until(hub.listening.is_set)
+        await asyncio.sleep(0)
+        room = hub.subscribe("a")
+        room.hub_stream = True
+        hub._resync()
+        if by == "notification":
+            item = ("notify", "a")
+            hub._notify("a")
+        else:
+            item = ("wake", "a", "typing")
+            hub._dispatch(item, "a")  # fills the queue without ending the wait
+            hub._fire_resync(room)  # the timer's time came
+        assert not room.ended
+        assert hub.stats().dropped_total == 0
+        assert room.resync_pending
+        assert room.resync_timer is None
+        assert await room.wait(0.5) == [item, ("marker", RESYNC)]
+        assert not room.resync_pending
+
+
+async def test_a_stream_asked_for_after_the_hub_stopped_is_refused_as_during_shutdown(db):
+    hub = make_hub(db)
+    async with hub.lifespan():
+        pass
+    with pytest.raises(HTTPException) as refused:
+        hub.sse("a", read=lambda after: [])
+    assert refused.value.status_code == 503
+    with pytest.raises(TooManySubscribers, match="shutting down"):
+        hub.subscribe("a")
+
+
+@pytest.mark.parametrize("hub_stream", [True, False])
+async def test_with_no_spread_a_resync_comes_at_once_even_to_a_full_queue(db, hub_stream):
+    hub = make_hub(db, resync_spread=0, queue_size=1)
+    async with hub.lifespan():
+        await until(hub.listening.is_set)
+        await asyncio.sleep(0)
+        room = hub.subscribe("a")
+        room.hub_stream = hub_stream
+        hub._dispatch(("wake", "a", "typing"), "a")
+        hub._resync()
+        assert not room.ended
+        assert await room.wait(0.5) == [("wake", "a", "typing"), ("marker", RESYNC)]
+
+
+async def test_shutdown_replaces_a_revoke_not_yet_said(db):
+    hub = make_hub(db)
+    async with hub.lifespan():
+        revoked = hub.subscribe("a", "ann")
+        revoked.hub_stream = True  # as `hub.stream` marks its own: it stays known until it has said goodbye
+        hub.close(owner="ann")
+        hub.close_all()
+        assert revoked.end_marker == CLOSING  # its goodbye says shutdown, with the spread-out retry
+        assert await revoked.wait(0.5) == [("marker", CLOSING)]
+
+
+async def test_a_resync_skips_a_stream_that_already_ended(db):
+    hub = make_hub(db, resync_spread=5)
+    async with hub.lifespan():
+        await until(hub.listening.is_set)
+        await asyncio.sleep(0)
+        ended = hub.subscribe("a", "ann")
+        ended.hub_stream = True
+        hub.close(owner="ann")
+        hub._resync()
+        assert ended.resync_timer is None
+
+
+def test_a_signal_that_is_not_text_is_refused(db):
+    hub = make_hub(db)
+    with pytest.raises(TypeError, match="a signal must be a str"):
+        hub.wake("a", 1)  # type: ignore[arg-type]  # it would never match a label
+    with pytest.raises(TypeError, match="a signal must be a str"):
+        hub.ephemeral("typing", ttl=8, signal=1)  # type: ignore[arg-type]
+
+
+def test_an_on_error_that_cannot_be_called_is_refused():
+    with pytest.raises(TypeError, match="on_error must be a function"):
+        Hub("postgresql://x", "c", on_error="sentry")  # type: ignore[arg-type]
+
+
+async def test_close_all_before_the_hub_ever_ran_leaves_it_saying_it_is_not_running(db):
+    hub = make_hub(db)
+    hub.close_all()  # a teardown or a signal hook, with no lifespan yet
+    assert not hub.closing
+    with pytest.raises(RuntimeError, match="the hub is not running"):
+        hub.subscribe("a")
+
+
+async def test_a_read_that_cannot_be_called_is_refused_clearly(db):
+    hub = make_hub(db)
+    async with hub.lifespan():
+        with pytest.raises(TypeError, match="read must be a function"):
+            hub.stream("a", read=None)  # type: ignore[arg-type]
+        assert hub.stats().open_streams == 0
+    with pytest.raises(TypeError, match="read must be a function"):
+        distinct("not a read", key=lambda event: event)  # type: ignore[arg-type]
+
+
+def test_every_goodbye_reason_is_counted_and_has_a_retry():
+    reasons = {reason for _, reason, _ in hub_module._ENDS.values() if reason}
+    assert reasons == set(dataclasses.asdict(EndedTotals())) == set(hub_module._RETRY_MS)
+
+
+async def test_a_stopped_hub_posts_nothing_to_the_loop_it_ran_on(db):
+    hub = make_hub(db)
+    async with hub.lifespan():
+        pass
+    closer = threading.Thread(target=hub.close, kwargs={"owner": "ann"})
+    with mock.patch.object(asyncio.get_running_loop(), "call_soon_threadsafe") as post:
+        hub.wake("a")
+        hub.call_later(1, print)
+        hub.close(owner="ann")
+        closer.start()
+        closer.join()
+    post.assert_not_called()
+
+
+async def test_a_repeated_notification_needs_room_only_for_the_held_back_resync(db):
+    hub = make_hub(db, resync_spread=5, queue_size=2)
+    async with hub.lifespan():
+        await until(hub.listening.is_set)
+        await asyncio.sleep(0)
+        room = hub.subscribe("a")
+        room.hub_stream = True
+        hub._notify("a")  # queued: one slot left
+        hub._resync()
+        hub._notify("a")  # a repeat takes no slot, so the resync gets the last one
+        assert room.resync_timer is None
+        assert await room.wait(0.5) == [("notify", "a"), ("marker", RESYNC)]
+
+
+async def test_streams_lists_every_open_subscription_oldest_first_with_its_age(db):
+    hub = make_hub(db)
+    assert hub.streams() == []
+    async with hub.lifespan():
+        first = hub.subscribe("a", owner="ann")
+        await asyncio.sleep(0.05)
+        hub.subscribe(None)
+        info = hub.streams()
+        assert [(s.key, s.owner) for s in info] == [("a", "ann"), (None, None)]
+        assert info[0].age_seconds >= 0.05
+        assert info[0].age_seconds > info[1].age_seconds
+        hub.unsubscribe(first)
+        assert [s.key for s in hub.streams()] == [None]
+    assert hub.streams() == []
+
+
+async def test_a_held_back_resync_reaches_a_subscription_late_and_never_one_that_is_gone(db):
+    hub = make_hub(db, resync_spread=0.2)
+    async with hub.lifespan():
+        await until(hub.listening.is_set)
+        await asyncio.sleep(0)  # the first LISTEN's resync is delivered before these subscribe
+        kept, gone = hub.subscribe("a"), hub.subscribe("b")
+        kept.hub_stream = gone.hub_stream = True  # as `hub.stream` marks its own
+        hub._resync()
+        hub.unsubscribe(gone)
+        assert gone.resync_timer is None
+        assert await kept.wait(1) == [("marker", RESYNC)]
+        await asyncio.sleep(0.25)
+        assert not gone._items
+
+
+async def test_a_subscribe_queue_gets_its_resync_at_once_while_a_stream_waits_its_turn(db, monkeypatch):
+    monkeypatch.setattr(hub_module.random, "uniform", lambda low, high: high)  # a random wait could be under 0.2 s
+    hub = make_hub(db, resync_spread=5)
+    reads: list[Wake] = []
+
+    def read(after, wake):
+        reads.append(wake)
+        return []
+
+    async with hub.lifespan():
+        await until(hub.listening.is_set)
+        await asyncio.sleep(0)
+        raw = hub.subscribe("a")
+        body = hub.stream("a", read=read, cursor=0)
+        assert await anext(body) == "id: 0\n\n"
+        reading = asyncio.ensure_future(anext(body))  # a stream only runs while it is read
+        await until(lambda: len(reads) == 1)
+        hub._resync()
+        assert await raw.wait(0.5) == [("marker", RESYNC)]
+        await asyncio.sleep(0.2)
+        assert len(reads) == 1  # the stream's resync is still held back
+        reading.cancel()
+        await asyncio.gather(reading, return_exceptions=True)
+        await body.aclose()

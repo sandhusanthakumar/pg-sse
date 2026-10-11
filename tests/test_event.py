@@ -1,3 +1,4 @@
+import uuid
 from datetime import datetime
 
 import pytest
@@ -47,6 +48,15 @@ def test_a_cursor_frame_has_no_data():
     assert encode_cursor(42) == "id: 42\n\n"
 
 
+@pytest.mark.parametrize("cursor", [(12, 3), (42,), [12, 3]])
+def test_a_tuple_or_list_is_not_written_as_an_id_the_browser_would_send_back(cursor):
+    # "(12, 3)" would come back as Last-Event-ID, and IntCursor refuses it.
+    with pytest.raises(TypeError, match=r"IntCursor\.format"):
+        encode_cursor(cursor)
+    with pytest.raises(TypeError, match=r"IntCursor\.format"):
+        encode(Event("x", id=cursor))
+
+
 def test_data_that_is_not_json_native_needs_a_default():
     event = Event({"at": datetime(2026, 1, 2, 3, 4, 5)})
     assert encode(event, default=str) == 'data: {"at":"2026-01-02 03:04:05"}\n\n'
@@ -61,8 +71,6 @@ def test_a_goodbye_sets_the_retry_and_names_the_reason_only_when_asked():
 
 def test_the_read_and_start_aliases_are_public():
     assert {"Read", "Start"} <= set(pg_sse.__all__)
-    assert pg_sse.Read is not None
-    assert pg_sse.Start is not None
 
 
 def test_decode_names_the_frames_a_stream_yields():
@@ -125,3 +133,23 @@ def test_decode_follows_the_sse_parsing_rules():
     assert decode("retry: 1x\n\n").retry is None  # digits only
     with pytest.raises(ValueError, match="no data"):
         decode(": ping\n\n").json()
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ({"id": 12}, r"row\[0\], not the row"),  # a dict_row
+        ({12}, r"row\[0\], not the row"),
+        (frozenset({12}), r"row\[0\], not the row"),
+        (b"42", "cannot be bytes"),  # it would go out as "b'42'"
+        (memoryview(b"42"), "cannot be bytes"),
+        (True, "cannot be a bool"),  # it would go out as "True"
+    ],
+)
+def test_a_value_that_would_not_come_back_as_a_cursor_is_refused_as_an_id(value, message):
+    with pytest.raises(TypeError, match=message):
+        encode(Event("x", id=value))
+
+
+def test_an_id_of_another_scalar_type_is_sent_as_its_text():
+    assert encode(Event("x", id=uuid.UUID(int=12))) == f"id: {uuid.UUID(int=12)}\ndata: x\n\n"

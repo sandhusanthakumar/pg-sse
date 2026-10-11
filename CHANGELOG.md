@@ -5,6 +5,65 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-11
+
+### Added
+
+- `hub.close(owner=..., key=...)` ends this process's streams opened with that owner and/or on that key, with the
+  goodbye reason `revoked`, so a removed operator or revoked session does not keep a stream until `max_stream_seconds`.
+  A read or `start` that is running when it is called is cut short and its goodbye goes out at once.
+- `Hub(resync_spread=2.0)`: after the listener connects or reconnects, each stream waits a random 0 to that many
+  seconds before its re-read, so a database that has just come back is not hit by every stream at once. `0` reads at
+  once, as before.
+- `Hub(on_error=...)`: `on_error(key, exc)` is called when a stream fails, for an error tracker. A slow
+  tracker holds up neither the response nor other streams.
+- `Hub(read_executor=...)`: an executor for plain `read` and `start` functions, instead of asyncio's shared pool.
+- `Hub(application_name=...)` names the listener connection in `pg_stat_activity` (default `pg-sse-listener`).
+- `hub.stream(..., max_stream_seconds=...)` and `hub.sse(...)` override the hub's age limit for one stream.
+- `hub.streams()` lists every open stream as `StreamInfo(key, owner, age_seconds, ended)`, for an admin view.
+- `HubStats.ended_total` counts goodbyes by reason (`max_age`, `shutdown`, `revoked`, `behind`), and
+  `HubStats.read_errors_total` counts failed streams.
+- `pg_sse.signal_read(...)` builds the `read(cursor, wake)` for streams that tell the page what to refetch: an event
+  name for the start, a resync, notified keys and each signal. A malformed argument raises when it is called.
+- `Wake.signal_keys` maps each signal to the keys it was sent for.
+- `pg_sse.IntCursor(parts=1, *, sep=".", max_digits=15)` parses and formats an integer cursor such as `42` or `12.3`
+  from a client: ASCII digits only, `ValueError` for anything else, `None` for no cursor. `IntCursor.parse_one(text)` is the
+  one-part shortcut for `hub.sse(cursor=...)`.
+- `Ephemeral.reset()` forgets every key and signal without waking any stream, for test fixtures.
+
+### Changed
+
+- Every re-read after a listener connect or reconnect is delayed by up to `resync_spread` (2 s by default). Set it to
+  `0` where a test needs it at once.
+- A stream takes its slot when `hub.stream` or `hub.sse` is called, not when its first frame is read, so the caps are
+  exact and the `busy` goodbye is gone. A stream that is never read gives its slot back when it is garbage-collected.
+  One that was closed or dropped keeps its slot until it has said goodbye (10 seconds at most).
+- A collection or raw bytes as a `cursor`, a `start()` result or an `Event` id raises `TypeError`; it used to be sent
+  as `id: (12, 3)`. A text cursor with a line break or NUL starts the stream from now. For a tuple, pass `parsed[0]`
+  or `IntCursor.format(*parsed)`.
+- An int `owner` is turned into text, so `close(owner=7)` finds a stream opened with `owner=7` or `"7"`. Any other
+  non-`str` owner (a `UUID`, a `bool`) raises `TypeError`; use `str(owner)`.
+- `Subscription.queue` is private: read a `hub.subscribe` queue with `subscription.wait()`. `Subscription.ended` is
+  read-only; end one with `subscription.close()` and `hub.unsubscribe(subscription)`.
+- After `hub.lifespan()` has exited, `hub.stream` and `hub.subscribe` raise `TooManySubscribers` (a 503 from
+  `hub.sse`), as during shutdown, instead of `RuntimeError`. A hub that never ran still raises `RuntimeError`.
+- `hub.close_all()` is safe from any thread.
+- `Hub(end_event=...)`, `end_event` and `listen_timeout` are checked when given, not at the first goodbye.
+- A stream closed while its `read` runs says goodbye at once, and a failure of that read is not reported as an error.
+- `hub.wake` and `Ephemeral` refuse a signal that is not a `str`.
+- Through the hub, `distinct` runs a sync `read` in `read_executor`.
+
+### Fixed
+
+- `max_stream_seconds`, `reread_seconds` and `ping_seconds` refuse NaN, which used to switch the limit or the re-read
+  off silently. A `Decimal` duration is accepted and stored as `float`; it used to fail inside every stream.
+- A stream created before the hub stopped and read after it started again says goodbye with reason `shutdown`; it used
+  to subscribe to the new run.
+- `Ephemeral` refuses a NaN or infinite `ttl` or `grace`, or a `bool`.
+- The README and `examples/chat.py` parsed `Last-Event-ID` with `isdigit()` and `int()`, and `"²"` passes the first and
+  fails the second, so a client could make the stream route return a 500. They use `IntCursor` now.
+- `trigger_sql` accepted a name with a trailing newline (`"room\n"`) because the check used `$`.
+
 ## [0.2.0] - 2026-10-10
 
 ### Added
@@ -24,8 +83,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   instead of the 503, e.g. one an error tracker is set to ignore.
 - `pg_sse.Read` and `pg_sse.Start`, the types of the `read` and `start` arguments, are public.
 - `examples/inbox.py`: a runnable signal-stream example (inbox, typing indicator with `hub.ephemeral`).
-- README: SQLAlchemy and Alembic snippets (run migrations on the psycopg driver: asyncpg rejects the multi-statement
-  SQL), the API reference as one section per name, a Logging section, and a link to `llms.txt`.
 - `hub.ephemeral(name, *, ttl, ...)` and `pg_sse.Ephemeral`: per-key signals that lapse unless renewed (typing,
   presence). `set(key, who)` renews or starts a signal and `set(key, who, on=False)` or `clear(key)` removes it; the
   key's streams are woken (with `hub.wake`) when what a reader sees changes and when a signal lapses, so a closed tab
@@ -37,8 +94,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   applied: drop only events that would not advance the cursor.
 - `pg_sse.testing`: `next_frame`, `next_event` (skips pings and id-only frames), `goodbye`, `ended` and `until` for
   reading `hub.stream` in tests, and `decode` and `Frame` to parse an SSE frame. No test framework or database needed.
-- README: the priority a signal stream's `read` should answer causes in, an async `read` example, a table of the
-  frames a stream yields, and how to test a stream with `async with hub.lifespan():` and `pg_sse.testing`.
 
 ### Changed
 
@@ -94,6 +149,7 @@ First release.
   than `queue_size` distinct keys or signals arrive during one read.
 - Python 3.11+, Postgres 14+, psycopg 3.
 
-[Unreleased]: https://github.com/sandhusanthakumar/pg-sse/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/sandhusanthakumar/pg-sse/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/sandhusanthakumar/pg-sse/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/sandhusanthakumar/pg-sse/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/sandhusanthakumar/pg-sse/releases/tag/v0.1.0

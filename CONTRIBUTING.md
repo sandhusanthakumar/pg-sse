@@ -1,6 +1,6 @@
 # Contributing
 
-The library is small (about 1,300 lines in `src/pg_sse/`). Read `README.md` and `src/pg_sse/_hub.py` first.
+The library is small (about 2,200 lines in `src/pg_sse/`). Read `README.md` and `src/pg_sse/_hub.py` first.
 
 ## Set up
 

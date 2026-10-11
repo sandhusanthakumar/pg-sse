@@ -126,3 +126,14 @@ def test_signal_streams_say_what_to_refetch_and_typing_lapses(inbox):
         # Nobody typed again: the lapse check announces it and the room refetches an empty list.
         assert read_frame(room_lines) == {"event": "typing", "data": "{}"}
         assert client.get("/rooms/lobby/typing").json() == {"typing": []}
+
+
+def test_a_last_event_id_that_is_not_a_cursor_starts_the_stream_from_now(server):
+    # b"\xb2" reaches the app as "²", which str.isdigit() accepts and int() rejects: a 500 if parsed by hand. A 422
+    # would be no better: EventSource stops for good on any response that is not a 200.
+    with httpx.Client(base_url=server, timeout=10) as client:
+        latest = client.post("/rooms/lobby/messages", json={"body": "before"}).json()["id"]
+        for value in (b"\xb2", b"abc", b"-1", b"1.5", b"(1,)"):
+            with client.stream("GET", "/rooms/lobby/stream", headers={"Last-Event-ID": value}) as response:
+                assert response.status_code == 200, value
+                assert read_frame(response.iter_lines()) == {"id": str(latest)}, value  # from now: not "before"

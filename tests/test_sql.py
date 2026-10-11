@@ -14,12 +14,13 @@ from pg_sse import drop_trigger_sql, trigger_sql
         ("Messages", "room", "c", None),
         ("messages", "room-id", "c", None),
         ("messages", "room", "c;drop", None),
+        ("messages", "room\n", "c", None),
         ("messages", "room", "c", "Id"),
         ("bad schema.messages", "room", "c", None),
         ("", "room", "c", None),
     ],
 )
-def test_only_plain_lower_case_identifiers(table, key, channel, order):
+def test_only_plain_lower_case_identifiers_are_accepted(table, key, channel, order):
     with pytest.raises(ValueError, match="identifier"):
         trigger_sql(table, key, channel, order_column=order)
 
@@ -69,7 +70,7 @@ def test_running_it_twice_is_harmless(db):
         assert _payloads(listener) == ["a"]
 
 
-def test_a_schema_qualified_table(db):
+def test_a_schema_qualified_table_gets_its_trigger(db):
     execute(db.dsn, "CREATE TABLE messages (id bigserial PRIMARY KEY, room text NOT NULL)")
     execute(db.dsn, trigger_sql(f"{db.schema}.messages", "room", db.channel, order_column="id"))
     with _listen(db.dsn, db.channel) as listener:
