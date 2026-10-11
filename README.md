@@ -45,10 +45,11 @@ That creates two triggers:
 ```python
 from typing import Annotated
 from fastapi import FastAPI, Header
-from pg_sse import Event, Hub
+from pg_sse import Event, Hub, IntCursor
 
 hub = Hub(DIRECT_DATABASE_URL, channel="room_change")  # a direct connection, not a pooled one
 app = FastAPI(lifespan=hub.lifespan)
+cursors = IntCursor()  # a Last-Event-ID is client input: only digits get through
 
 
 def read_after(room: str, after: int) -> list[Event]:
@@ -62,7 +63,7 @@ def latest_id(room: str) -> int:
 
 @app.get("/rooms/{room}/stream")
 async def stream(room: str, last_event_id: Annotated[str | None, Header()] = None):
-    cursor = int(last_event_id) if last_event_id and last_event_id.isdigit() else None  # client input: parse it
+    cursor = cursors.parse_one(last_event_id)  # None for no header or one that is not a cursor: start from now
     return hub.sse(room, read=lambda after: read_after(room, after), cursor=cursor, start=lambda: latest_id(room))
 ```
 
@@ -73,7 +74,7 @@ const source = new EventSource("/rooms/lobby/stream");
 source.onmessage = (e) => render(JSON.parse(e.data));
 ```
 
-`EventSource` reconnects by itself and sends `Last-Event-ID`; the stream catches up from there.
+`EventSource` reconnects by itself and sends `Last-Event-ID`; the stream catches up from there. The header is client input, so `IntCursor` lets only digits through, and the route starts anything else from now, as if there were no header. Not a 422: `EventSource` stops for good on any response that is not a 200, so one stale or malformed id (an old cursor format after a deploy) would end live updates in that tab. Do not hand-roll the check with `str.isdigit()`: it is true for `²`, which `int()` then rejects, so a client could turn the route into a 500.
 
 A full runnable app, with async reads on a connection pool and a browser page: [examples/chat.py](https://github.com/sandhusanthakumar/pg-sse/blob/main/examples/chat.py).
 
@@ -125,12 +126,13 @@ from fastapi import FastAPI, Header
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from pg_sse import Event, Hub
+from pg_sse import Event, Hub, IntCursor
 
 engine = create_async_engine("postgresql+asyncpg://...")  # the app's own connection, pooled however you like
 Session = async_sessionmaker(engine, expire_on_commit=False)
 hub = Hub(DIRECT_DATABASE_URL, channel="room_change")  # psycopg; a direct connection, not a pooled one
 app = FastAPI(lifespan=hub.lifespan)
+cursors = IntCursor()
 
 
 async def read_after(room_id: int, after: int) -> list[Event]:
@@ -148,11 +150,10 @@ async def latest_id(room_id: int) -> int:
 
 @app.get("/rooms/{room_id}/stream")
 async def stream(room_id: int, last_event_id: Annotated[str | None, Header()] = None):
-    cursor = int(last_event_id) if last_event_id and last_event_id.isdigit() else None
     return hub.sse(
         str(room_id),  # not room_id: an int subscribes fine, never wakes, and pg_sse raises a TypeError for it
         read=partial(read_after, room_id),
-        cursor=cursor,
+        cursor=cursors.parse_one(last_event_id),
         start=partial(latest_id, room_id),
     )
 ```
@@ -166,6 +167,7 @@ Both blocks were run against a real database (an Alembic upgrade and downgrade, 
 ```python
 # Django (ASGI; run the hub's lifespan from your ASGI app or a lifespan wrapper)
 from django.http import HttpResponse, StreamingHttpResponse
+from pg_sse import TooManySubscribers
 
 
 async def stream(request, room):
@@ -201,6 +203,7 @@ A stream doesn't have to carry data. It can tell the page *what* to refetch: "th
 | `start` | The stream's first read. |
 | `keys` | Keys with a database notification since the last read. |
 | `signals` | Labels from `hub.wake(key, signal=...)` since the last read. |
+| `signal_keys` | For each of those labels, the keys it was sent for: a per-key stream sees its own key, an all-keys stream sees which keys signalled. Not part of equality, so `Wake(signals=...)` in a test still equals what the hub passes. |
 | `resync` | The listener connected or reconnected: anything may have changed. |
 | `reread` | Nothing woke the stream for `reread_seconds`. |
 
@@ -217,21 +220,32 @@ async def signals(cursor, wake: Wake) -> list[Event]:
         return [Event({}, event="ready")]  # the page loads everything once
     if wake.resync or wake.reread:
         return [Event({}, event="resync")]  # anything may have changed
+    events = []  # a write and a signal can arrive together: answer both
     if wake.keys:
-        return [Event({"keys": sorted(wake.keys)}, event="change")]
+        events.append(Event({"keys": sorted(wake.keys)}, event="change"))
     if "typing" in wake.signals:
-        return [Event({}, event="typing")]  # refetch only the typing indicator
-    return []
+        events.append(Event({}, event="typing"))  # refetch only the typing indicator
+    return events
 
 
 @app.get("/inbox/stream")
 async def inbox(user: User = Depends(current_user)):
-    return hub.sse(None, read=signals, owner=user.id)  # every key on the channel
+    return hub.sse(None, read=signals, owner=str(user.id))  # every key on the channel; an int would also do
 
 
 typing = hub.ephemeral("typing", ttl=8)  # at import time, next to the hub
 # elsewhere, from any thread, on every keystroke:
 typing.set(room_id, user_id)
+```
+
+`signal_read` builds that function for you, with the same order of causes:
+
+```python
+from pg_sse import signal_read
+
+read = signal_read(change="messages", signals={"typing": "typing"})
+hub.sse(room, read=read)
+# sends: "ready" first; "resync" after a reconnect or a quiet re-read; "messages" for a write; "typing" for that signal
 ```
 
 A runnable version, with a typing indicator that lapses on its own and an inbox that watches every room: [examples/inbox.py](https://github.com/sandhusanthakumar/pg-sse/blob/main/examples/inbox.py).
@@ -268,10 +282,10 @@ typing.live(room_id)  # ["ann", "bo"]: who has not lapsed, for the GET the page 
 - **Re-reads on every wake-up**, and a burst of notifications costs one read.
 - **Pings every 15–25 s** (`ping_seconds`) with an SSE comment, so proxies do not time an idle stream out. A ping costs no database read.
 - **Re-reads after 60 s of quiet** (`reread_seconds`) even when nothing woke it. This is the safety net under every lost notification: the worst case is a one-minute delay.
-- **Wakes every stream after the listener connects or reconnects**, since anything committed before its LISTEN existed (at startup, or while it was down) was missed. Reconnects with backoff; a `SELECT 1` every minute and TCP keepalives catch a half-open connection.
-- **Bounded queue per stream** (64). Identical wake-ups are queued once, so a hot key costs one slot, not one per write. A stream ends, rather than buffers, when more than `queue_size` distinct keys or signals arrive during one read (only an all-keys stream on a wide channel gets there); the browser reconnects and catches up.
-- **Caps** open streams per process (500) and, when you pass `owner` (a user id, session, or client address), per key and owner (5). Past a cap, `hub.sse` raises a `503` with `Retry-After: 30`. The per-owner cap counts one key at a time: an owner may hold 5 streams on *every* key it can name, up to the process cap. To bound one client's total, set `max_total_per_owner` (off by default). Without `owner`, a client is not counted at all and can hold every slot in a worker, so pass `owner` on public endpoints, and size the caps on the total rather than on the per-key number.
-- **Ends streams after 15 minutes.** A stream is authenticated once, when it opens; this bounds how long a revoked session keeps one.
+- **Wakes every stream after the listener connects or reconnects**, since anything committed before its LISTEN existed (at startup, or while it was down) was missed. Each stream re-reads after its own random delay of up to `resync_spread` (2 s), so the reads do not arrive together. Reconnects with backoff; a `SELECT 1` every minute and TCP keepalives catch a half-open connection.
+- **Bounded queue per stream** (64). Identical wake-ups are queued once, so a hot key costs one slot, not one per write. A stream ends, rather than buffers, when more than `queue_size` distinct keys or signals arrive during one read (only an all-keys stream on a wide channel gets there). It still sends what that read found, so its cursor moves on, then says `behind`; the browser reconnects and catches up.
+- **Caps** open streams per process (500) and, when you pass `owner` (a user id, session, or client address, as text), per key and owner (5). Past a cap, `hub.sse` raises a `503` with `Retry-After: 30`. The per-owner cap counts one key at a time: an owner may hold 5 streams on *every* key it can name, up to the process cap. To bound one client's total, set `max_total_per_owner` (off by default). Without `owner`, a client is not counted at all and can hold every slot in a worker, so pass `owner` on public endpoints, and size the caps on the total rather than on the per-key number.
+- **Ends streams after 15 minutes.** A stream is authenticated once, when it opens; this bounds how long a revoked session keeps one. To end it sooner, call `hub.close(owner=...)` when you revoke.
 - **Ends every stream on SIGTERM**, so a deploy doesn't wait out uvicorn's graceful-shutdown timeout. It chains onto the server's handler; with no handler installed (a plain script) the default action is left alone and ends the process as usual.
 - **Says goodbye before a planned close.** The last frame carries `retry:`, which `EventSource` applies by itself, and, with `end_event` set, a named event with the reason:
 
@@ -280,7 +294,7 @@ typing.live(room_id)  # ["ann", "bo"]: who has not lapsed, for the GET the page 
 | `max_age` | The stream reached `max_stream_seconds`. | 1000 | Reconnect now, with its cursor. |
 | `shutdown` | SIGTERM, or the lifespan ending. | 1000–5000, random | Reconnect after the delay. The jitter spreads a deploy's reconnects out. |
 | `behind` | The stream's queue filled. | 1000 | Reconnect and catch up from its cursor. |
-| `busy` | A cap filled between the check in `hub.sse` and the stream starting. | 30000 | Back off, as for a `503` with `Retry-After: 30`. |
+| `revoked` | `hub.close` ended it (an owner or key was revoked). | 1000 | Reconnect; the route's own auth check decides whether it is let in. |
 
 There is no goodbye after `Event(final=True)`, since the application already said what it meant, or when `read` raised, since the stream's state is unknown and an abrupt close is the honest signal.
 
@@ -293,7 +307,7 @@ source.addEventListener("end", (e) => console.debug("stream ended:", JSON.parse(
 // A fetch-based reader decides for itself.
 if (event.event === "end") {
   const { reason } = JSON.parse(event.data);
-  scheduleReconnect(reason === "busy" ? 30_000 : event.retry ?? 1_000);
+  scheduleReconnect(event.retry ?? 1_000);
 }
 ```
 
@@ -306,7 +320,8 @@ Everything is importable from `pg_sse`. Each name below has a short description;
 ```python
 Hub(conninfo, channel, *, max_subscribers=500, max_per_owner=5, max_total_per_owner=None, queue_size=64,
     max_stream_seconds=900, ping_seconds=(15, 25), reread_seconds=60, json_default=None, end_event=None,
-    handle_signals=True, listen_timeout=5.0)
+    handle_signals=True, listen_timeout=5.0, resync_spread=2.0, application_name="pg-sse-listener",
+    read_executor=None, on_error=None)
 ```
 
 One per channel per process.
@@ -316,38 +331,45 @@ One per channel per process.
 - `max_per_owner`: open streams per key and owner, so several tabs on one room are one client. It does not limit how many keys an owner opens streams on.
 - `max_total_per_owner`: open streams per owner across all keys; `None` (the default) sets no total. This is the cap that keeps one client from filling `max_subscribers`.
 - Both owner caps apply only to streams opened with an `owner`; anonymous streams are limited by `max_subscribers` alone. A refused stream is a `TooManySubscribers`, a 503 from `hub.sse`.
-- `queue_size`: wake-ups queued per stream before it is ended as too far behind. At least 1.
-- `max_stream_seconds`: how long a stream lives before a planned close.
+- `queue_size`: wake-ups queued per stream before it is ended as too far behind. At least 1. A resync takes no slot.
+- `max_stream_seconds`: how long a stream lives before a planned close. `math.inf` turns the limit off.
+- The durations here and in `Ephemeral` take any real number (`int`, `float`, `Decimal`, a numpy scalar) and are kept as `float`; a `bool`, a string or NaN raises `ValueError`.
 - `ping_seconds`: the `(low, high)` range, jittered, between pings on an idle stream.
 - `reread_seconds`: how long a stream may sit quiet before it re-reads anyway.
 - `json_default`: `json.dumps`'s `default` for `Event` data that is not JSON-native. `json_default=str` is the common choice for datetimes, UUIDs and Decimals.
-- `end_event`: names the event sent with the reason before a planned close. Off by default; the `retry:` alone is always sent.
+- `end_event`: names the event sent with the reason before a planned close. Checked when it is given: an empty name, or one with a line break or NUL, raises `ValueError` (here and in `stream`/`sse`). Off by default; the `retry:` alone is always sent.
 - `handle_signals`: chain onto SIGTERM and SIGINT so streams end at once on a deploy. Pass `False` in tests.
-- `listen_timeout`: seconds `lifespan` waits for the first LISTEN before the app starts (`None`: do not wait). It never fails startup.
+- `listen_timeout`: seconds `lifespan` waits for the first LISTEN before the app starts (`None`: do not wait). A finite number, 0 or more. It never fails startup.
+- `resync_spread`: after the listener connects or reconnects, every stream re-reads. Each waits a random 0 to this many seconds first, so a database that has just come back is not hit by every open stream at once (up to `max_subscribers` reads queued behind your thread pool or connection pool). A notification for the stream's key during the wait starts the resync early (an all-keys stream keeps its time: every notification reaches it, so on a busy channel the first one would end all their waits at once). Any read in the meantime that re-reads everything counts as the resync: every read of a `read(cursor)`, and a quiet re-read. A `read(cursor, wake)` woken by a `hub.wake` signal alone reads at once and still gets its resync at its time. A resync takes no queue slot, so it never ends a busy stream as behind. `0` reads at once. Pings and the periodic re-read are already jittered; this closes the one synchronised burst.
+- `read_executor`: a thread pool (`concurrent.futures.ThreadPoolExecutor`; a `ProcessPoolExecutor` or `InterpreterPoolExecutor` raises `ValueError`, since a read runs with the caller's context variables) for plain (not async) `read` and `start` functions. By default they share asyncio's thread pool (at most 32 threads, also used by everything else that calls `asyncio.to_thread`), so a burst of stream re-reads can starve other work. Give the streams their own bounded pool: `ThreadPoolExecutor(8, thread_name_prefix="sse-read")`. Async reads do not use it, and the hub never shuts it down.
+- `on_error`: `on_error(key, exc)`, called when a stream fails, after the failure is logged: `read` or `start` raised, or `read` returned something the hub could not send (not an `Event`, data `json.dumps` refuses, a tuple id). Use it to report to an error tracker. A plain function runs in asyncio's default pool (not `read_executor`, where in an outage it would wait behind the failing reads), and an `async def` one on the loop, each as its own task, so a slow tracker never holds the failed response open, its slot taken, or the loop; leaving `lifespan` waits up to 5 seconds for those still running, then cancels them. An exception either raises is logged and ignored. The stream still ends without a goodbye.
+- `application_name`: what `pg_stat_activity` shows for the listener's connection, to tell several services' listeners apart.
 
 ### `hub.lifespan`
 
-`FastAPI(lifespan=hub.lifespan)`, or `async with hub.lifespan():` inside your own lifespan. Chains onto an existing SIGTERM/SIGINT handler (a default action is left alone) and restores it when it exits. Starts without a database: the listener keeps retrying and `listener_connected` says whether it is live.
+`FastAPI(lifespan=hub.lifespan)`, or `async with hub.lifespan():` inside your own lifespan. Chains onto an existing SIGTERM/SIGINT handler (a default action is left alone) and restores it when it exits. Starts without a database: the listener keeps retrying and `listener_connected` says whether it is live. On exit every stream says goodbye with reason `shutdown`, including one created but not read yet, even if it is first read after the hub has started again. After it, `hub.stream` and `hub.sse` refuse new streams as during shutdown (a 503 from `hub.sse`).
 
 ### `hub.stream`
 
 ```python
-hub.stream(key, read, *, cursor=None, start=None, owner=None, end_event=None) -> AsyncIterator[str]
+hub.stream(key, read, *, cursor=None, start=None, owner=None, end_event=None, max_stream_seconds=None) -> AsyncIterator[str]
 ```
 
-The primary API: an async iterator of encoded SSE frames, for any framework. Raises `TooManySubscribers` when it is called, before any response exists.
+The primary API: an async iterator of encoded SSE frames, for any framework. Raises `TooManySubscribers` when it is called, before any response exists: the stream takes its slot then, not when its first frame is read, and gives it back when it ends, or, for a response that was never sent (the route raised after making it, or the client left before the body started), when it is garbage-collected (at once on CPython) and 30 seconds after it was made at the latest. A server reads a stream the moment it sends the response, so one read after that ends at once, with no goodbye.
 
 - `key`: what the stream watches, or `None` for every key on the channel. It must be a `str`, the text form of the key column (`str(room_id)` for an integer column): the notification payload is `key::text`, a NULL key notifies `""`, and any other type raises a `TypeError`.
 - `read`: takes `(cursor)` or `(cursor, wake)` and returns a list of `Event`, not a generator, which would run its queries on the event loop. A plain function runs in a thread; an async one runs on the loop. Its type is `pg_sse.Read`.
-- `cursor`: where to start, already parsed from the client (`Last-Event-ID`, a query parameter).
+- `cursor`: where to start, already parsed from the client (`Last-Event-ID`, a query parameter). `IntCursor` parses and checks an integer one. Text with a line break or NUL cannot be an SSE id: the stream then starts from now, with a warning at most once a minute, rather than answering the client with a 500. A cursor of the wrong type (a row, bytes, a bool) raises `TypeError`.
 - `start`: gives the current cursor when `cursor` is `None`, so the stream starts from now. Plain or async. Its type is `pg_sse.Start`.
-- `owner`: a user id or session, for the per-owner cap.
+- `owner`: a user id or session, for the per-owner caps and `hub.close(owner=...)`. A `str`, or an `int`, which is turned into text, so `hub.close(owner=7)` and `hub.close(owner="7")` find the same streams. Any other type (a `UUID`, a `bool`) raises `TypeError`: pass `str(owner)`.
 - `end_event`: overrides the hub's.
+- `max_stream_seconds`: overrides the hub's age limit for this stream, so a visitor's stream can expire sooner than a dashboard session's. Must be greater than 0; `math.inf` for no limit.
 
 ### `hub.sse`
 
 ```python
-hub.sse(key, read, *, cursor=None, start=None, owner=None, end_event=None, headers=None, refuse_with=None)
+hub.sse(key, read, *, cursor=None, start=None, owner=None, end_event=None, max_stream_seconds=None,
+        headers=None, refuse_with=None)
 ```
 
 `stream` as a Starlette/FastAPI response (needs the `starlette` extra). Past a cap it raises a 503 with `Retry-After: 30`; `refuse_with(err)` returns your own exception to raise instead, e.g. one your error tracker ignores. `headers` are added to the response.
@@ -366,10 +388,34 @@ Event(data, id=None, event=None, final=False)
 ### `Wake`
 
 ```python
-Wake(start=False, keys=frozenset(), signals=frozenset(), resync=False, reread=False)
+Wake(start=False, keys=frozenset(), signals=frozenset(), resync=False, reread=False, signal_keys={})
 ```
 
 Why `read` runs, for a `read(cursor, wake)`. See [Signal streams](#signal-streams) for the fields. `wake.data_may_have_changed` is `True` unless the only causes are `hub.wake` signals.
+
+### `hub.close`
+
+```python
+hub.close(*, owner=None, key=None)
+```
+
+Ends this process's streams opened with `owner` and/or on `key`, so a removed operator, a blocked visitor or a revoked session does not keep a stream for up to `max_stream_seconds`. That includes a stream that `hub.sse` has created but whose first frame has not been read yet, a stream whose `read` is running (an `async def` read is cancelled, so the goodbye goes out at once; a plain one runs on in its thread and what it found is not sent), and a stream partway through sending a batch (the rest is not sent). Each stream sends a goodbye with reason `revoked` and ends. At least one argument is required; `hub.close_all()` ends every stream. `owner` is a `str` or an `int`, as for `stream`; any other type raises `TypeError`.
+
+- **When it acts.** Safe from any thread. Called on the event loop it takes effect before it returns; from another thread it is handed to the loop. It does nothing, silently, while the hub is not running, when there are no streams to end.
+- **Who it reaches.** A stream opened after the call (the user signed in again) is not ended with the old ones, even when the call came from another thread and reaches the loop later. A route that checked the session before the revoke but opens its stream after the call is not reached; `max_stream_seconds` bounds that window.
+- **Slots.** An ended stream's slot is free once it has said goodbye, or 10 seconds after it ended, whichever comes first. Until then it still holds a connection and counts against the caps and in `open_streams`, so a client that stops reading cannot open one stream after another, while a half-open connection (whose send blocks until TCP gives up) holds it no longer than that. A reconnect within that time can be refused with a 503. The same holds for a stream dropped for falling behind or ended by shutdown.
+- **A dropped stream past the grace.** Once its slot is free the hub forgets it. A dropped stream whose read is still running then is out of reach of a shutdown that starts later: it says `behind`, not `shutdown`, and reconnects a little sooner.
+- **Not for one tab per user.** Do not call it from the stream route to keep one tab per user: the closed tab reconnects a second later and its route closes the other, back and forth for as long as both are open.
+
+```python
+await db.revoke_session(session_id)  # first: the reconnect below must be refused
+hub.close(owner=str(user_id))
+```
+
+- Revoke in the database first. The client reconnects after the goodbye, and the route must refuse it; `EventSource` stops for good on a 401 or 403.
+- With both arguments, only streams matching both end. A stream watching every key (`key=None`) matches by `owner` only.
+- Only streams opened with `owner=` can be found by owner. Pass `owner` on every authenticated stream.
+- It reaches this process only. With several workers, call it in each one; nothing is broadcast.
 
 ### `hub.wake`
 
@@ -377,7 +423,7 @@ Why `read` runs, for a `read(cursor, wake)`. See [Signal streams](#signal-stream
 hub.wake(key, signal="wake", *, all_keys=True)
 ```
 
-Wakes one key's streams for a change that is not a database write (someone is typing). Safe from any thread, and reaches only this process's streams. `signal` shows up in `wake.signals`; `all_keys=False` leaves the all-keys streams alone. `key` must be a `str`.
+Wakes one key's streams for a change that is not a database write (someone is typing). Safe from any thread, and reaches only this process's streams. `signal` shows up in `wake.signals`; `all_keys=False` leaves the all-keys streams alone. `key` and `signal` must be `str`: a signal is matched against text labels, so an Enum would never match.
 
 ### `hub.call_later`
 
@@ -387,13 +433,55 @@ hub.call_later(seconds, callback, *args)
 
 Runs `callback(*args)` on the hub's event loop after `seconds`, for follow-up work on ephemeral state (check that a typing signal lapsed, then `hub.wake`). Safe from any thread; does nothing while the hub has no running loop.
 
+### `signal_read`
+
+```python
+signal_read(*, start="ready", resync="resync", change="change", change_data=None, signals=None) -> Read
+```
+
+An async `read(cursor, wake)` for streams that tell the page what to refetch instead of sending rows. It runs on the event loop with no thread hop. An empty event name raises `ValueError` (the browser would dispatch it as a plain `message`) and a name that is not a `str` raises `TypeError`; pass `None` to send nothing. With `resync=None`, a resync that arrives with notified keys or signals still sends their events. Every event's data is `{}`, except `change` when `change_data` is given and a signal mapped to `(event_name, data_fn)`.
+
+| Argument | Meaning |
+|---|---|
+| `start` | Event name for the stream's first read. `None` sends nothing. |
+| `resync` | Event name for "anything may have changed": the listener (re)connected, or `reread_seconds` of quiet passed. `None` sends nothing. |
+| `change` | Event name when a database notification reached the stream's key. `None` disables it. |
+| `change_data` | `fn(keys) -> payload` for the `change` event, given the keys notified since the last read. Default payload `{}`. A per-key stream might pass `lambda keys: {"conversationId": ...}`; an all-keys one `lambda keys: {"rooms": sorted(keys)}`. With `change=None` it raises `TypeError`, since no event would carry it. |
+| `signals` | `{signal_label: event_name}` for `hub.wake` and `Ephemeral` signals, such as `{"presence": "presence"}`; the event's data is `{}`. A value may be `(event_name, data_fn)` instead: `data_fn(keys)` gets the keys the signal was sent for and returns the data, e.g. `{"presence": ("presence", lambda keys: {"conversationIds": sorted(keys)})}`: a per-key stream gets its own key, an all-keys stream every key that signalled. `keys` is empty for a `Wake` built by hand without `signal_keys`, so do not index into it. One `signal_read` still serves every stream, because the keys come from the wake, not from a closure. Any other value raises `TypeError` when `signal_read` is called. |
+
+Causes are answered in this order, because the first two tell the page to refetch everything and anything after them would repeat it:
+
+1. `start`: only the start event.
+2. `resync` or `reread`: only the resync event.
+3. Otherwise the `change` event if keys were notified, then one event per mapped signal that arrived, in the order of `signals` (so the result is deterministic). A write that coincides with a signal sends both.
+
+A cause with no mapping, or mapped to `None`, contributes nothing, so the result may be `[]`.
+
+### `IntCursor`
+
+```python
+IntCursor(parts=1, *, sep=".", max_digits=15)
+```
+
+Parses and formats a cursor of `parts` non-negative integers joined by `sep`: `42`, or `12.3` for a feed that spans two tables.
+
+| Member | Behaviour |
+|---|---|
+| `parse_one(text)` | For `parts=1`, what a stream route wants: the integer, or `None` for no cursor and for anything that is not one, so the stream starts from now (not a 422: `EventSource` gives up for good on a non-200). Takes the header as text or as raw bytes (read as Latin-1, as HTTP does). Never raises for client input; `ValueError` if `parts` is not 1, and `TypeError` for an int, which the code parsed already. An all-digit header longer than `max_digits` logs a warning (at most once a minute, and only when a larger `max_digits` would read it), since it is likely an id this app sent and catching up would be lost: pass a larger `max_digits`. |
+| `parse(text)` | `None` or `""` gives `None`: no cursor, so the stream starts from `start=`. Anything else must be exactly `parts` groups of 1 to `max_digits` ASCII digits (leading zeros aside) joined by `sep`, and gives a tuple of ints (also for `parts=1`). Otherwise `ValueError("cursor must look like 1.2")`; a stream route should then start from now. Pass `format(*parsed)` as `cursor` for several parts: the hub raises `TypeError` for a tuple cursor or `Event` id, which it could not send as an id `parse` accepts back. |
+| `format(*values)` | The text for `Event(id=...)`. `ValueError` unless there are exactly `parts` values, each a non-negative `int` (a `bool` or a `float` is refused) that `parse` would accept back. |
+
+`max_digits=15` is exact in a JavaScript number. For longer ids (snowflake ids; a `bigint` has up to 19 digits) pass `max_digits=19`; `format` raises `ValueError` for a value with more digits than `max_digits`. Both `parse` and `format` raise `ValueError` for a part above the `bigint` maximum (9223372036854775807), so a 19-digit cursor never reaches the query out of range.
+
+The constructor raises `ValueError` for `parts` or `max_digits` that is not an `int` (a `bool` included), `parts < 1`, `max_digits` outside 1 to 19, or a `sep` that is not a `str`, is empty, or holds a digit, a line break or NUL.
+
 ### `distinct`
 
 ```python
 distinct(read, key)  # -> a read
 ```
 
-Wraps `read` so a snapshot is sent only when it changed. `key(event)` summarises what the event shows, as a hashable value; an event whose key equals the key of the last one sent is dropped. `None` means "always send" (the next event is then compared with nothing, so it is sent too), and a `final` event is always sent. `read` may be `read(cursor)` or `read(cursor, wake)`, sync or async; the wrapper keeps that shape.
+Wraps `read` so a snapshot is sent only when it changed. `key(event)` summarises what the event shows, as a hashable value; an event whose key equals the key of the last one sent is dropped. `None` means "always send" (the next event is then compared with nothing, so it is sent too), and a `final` event is always sent. `read` may be `read(cursor)` or `read(cursor, wake)`, sync or async; the wrapper takes the same arguments and is always async. A sync `read` runs in the hub's `read_executor` inside a stream, and in asyncio's default pool when you call the wrapper yourself (from a `hub.subscribe` loop, say), so it never blocks the loop. `key` runs on the event loop either way, once the events are back from `read`, so keep it cheap.
 
 ```python
 @app.get("/rooms/{room}/stream")
@@ -402,10 +490,11 @@ async def stream(room: str):
     return hub.sse(room, read=distinct(partial(snapshot, room), key=lambda e: e.data["unread"]))
 ```
 
-Two things to get right:
+Three things to get right:
 
 - **The state is per stream.** Call `distinct` inside the route, once per request. Built once at import time, one wrapper would be shared by every stream, and a stream that has never been sent a snapshot would be told nothing.
-- **A dropped event's `id` is never applied.** The hub advances the cursor only on events it yields, and the browser records only ids it receives. Drop only events whose id would not have advanced the cursor: a snapshot with no id, or one that repeats the last. Never drop an event that carries a new row, or a reconnect would replay from before it. Have `key` return `None` for any event that carries rows.
+- **A dropped event's `id` is never applied.** The hub advances the cursor only on events it yields, and the browser records only ids it receives. Drop only events whose id would not have advanced the cursor: a snapshot with no id, or one that repeats the last. Never drop an event that carries a new row, or a reconnect would replay from before it: make `key` change with every new row (next point), or, failing that, return `None` for any event that carries rows.
+- **`None` forgets the last key.** After an event that is always sent, the next snapshot is sent again even if it is unchanged. Where you can, make `key` cover everything the client is shown, including the newest message or row id: a new row then changes the key by itself and `None` is not needed.
 
 ### `hub.ephemeral` and `Ephemeral`
 
@@ -428,12 +517,21 @@ Signals per key that lapse unless renewed (typing, presence), announced with `hu
 | `set(key, who, on=True)` | Renews or starts (`on`) or removes (`not on`) `who`'s signal on `key`. Returns whether what a reader sees changed, and wakes the key's streams only then. A renewal returns False. Removing returns True if there was an entry, even one that lapsed a moment ago: someone may have read it before it lapsed. |
 | `clear(key, who=None)` | Removes one `who`, or everyone on `key`. Returns and wakes as `set(..., on=False)` does. |
 | `live(key)` | Who has not lapsed right now, in the order they started. Never lists an expired entry, even if its lapse check has not run. |
+| `reset()` | Forgets every key and signal, and wakes no stream. For a test fixture's clean slate. |
 
 `set` and `clear` are safe from any thread; `key` must be a `str`. Each renewal schedules one lapse check with `hub.call_later`; a check that finds the signal renewed leaves it alone, and the renewal's own check handles it later. State lives in this process only, so with several workers a signal set on one is invisible to the streams on the others, and it is lost on restart. While the hub is stopped nothing checks, so entries linger until the next `set` or `clear` for their key (`live` still skips them).
 
 ### `hub.stats`
 
-A frozen `HubStats`: `open_streams`, `refused_total`, `dropped_total`, `listener_connected`, `listener_reconnects_total` and `last_notification_at` (Unix time or `None`). Counters are per process and start at zero.
+A frozen `HubStats`: `open_streams`, `refused_total`, `dropped_total`, `listener_connected`, `listener_reconnects_total`, `last_notification_at` (Unix time or `None`), `read_errors_total` (streams that failed, as `on_error` reports them) and `ended_total`, a frozen `EndedTotals` of goodbyes sent by reason: `max_age`, `shutdown`, `revoked` and `behind`. "Streams dropped for being slow" is `dropped_total`; `ended_total.behind` counts the ones that then said so, which leaves out a dropped stream that a close or shutdown reached first, or whose client left. A goodbye is counted once the client took it, so a stream whose client left, or that ended with a `final` event or a failure, is in none of them. `dataclasses.asdict(hub.stats())` gives all of it as a dict, `ended_total` as a nested one. The `_total` fields only grow, so a metrics exporter can read them on a timer and publish them as counters. They are per process and start at zero. pg-sse ships no exporter code, since people use different ones.
+
+### `hub.streams`
+
+```python
+hub.streams() -> list[StreamInfo]
+```
+
+Every subscription still holding a slot, oldest first, as `StreamInfo(key, owner, age_seconds, ended)` (`key` is `None` for an all-keys stream, `owner` is `None` for one opened without it, and `ended` is true for one closed or dropped that is still saying goodbye: it counts against the caps until it has). For an admin view or a debug endpoint; this process only. It copies a set the event loop changes: safe from another thread under CPython's GIL, but on a free-threaded build call it on the event loop.
 
 ### `hub.listening`
 
@@ -446,9 +544,9 @@ hub.subscribe(key, owner=None) -> Subscription
 hub.unsubscribe(subscription)
 ```
 
-The low-level queue under `stream`, for a custom stream loop. `key` is checked like `stream`'s. Unsubscribe in a `finally`.
+The low-level queue under `stream`, for a custom stream loop. `key` and `owner` are checked like `stream`'s. Unsubscribe in a `finally`.
 
-`await subscription.wait(timeout)` returns everything queued once there is anything, or `None` on timeout. An item is `("notify", key)` for a database notification, `("wake", key, signal)` for a `hub.wake`, or `("marker", name)`, which means re-read everything. Once `subscription.ended` is true the stream is over: it fell behind, or the hub is shutting down (`hub.closing`).
+`await subscription.wait(timeout)` returns everything queued once there is anything, or `None` on timeout. An item is `("notify", key)` for a database notification, `("wake", key, signal)` for a `hub.wake`, or `("marker", name)`, which means re-read everything. Once `subscription.ended` is true the stream is over: it fell behind, the hub is shutting down (`hub.closing`), or `hub.close` ended it. After a listener connect or reconnect the resync marker arrives at once: `resync_spread` applies only to `hub.stream` and `hub.sse`, so a custom loop that serves many streams should add its own jitter.
 
 ### `Read` and `Start`
 
@@ -509,6 +607,15 @@ with TestClient(app) as client:  # runs the lifespan
     ...
 ```
 
+A fixture keeps that in one place. It needs an async plugin: anyio, with the tests marked `@pytest.mark.anyio`, or pytest-asyncio with `asyncio_mode = "auto"` (in its default strict mode, decorate it with `@pytest_asyncio.fixture` instead):
+
+```python
+@pytest.fixture
+async def running_hub():
+    async with hub.lifespan():
+        yield hub
+```
+
 To read a stream without a server, run the hub on the test's event loop with `async with hub.lifespan():` (leaving it forgets every subscription, so the next test starts clean) and read frames with `pg_sse.testing`:
 
 ```python
@@ -521,6 +628,8 @@ async def test_a_new_message_arrives():
         insert_message("lobby", "hi")
         assert (await next_event(frames)).json() == {"id": 1, "body": "hi"}
 ```
+
+The timings are plain attributes, so a test can shorten them after building the hub and its signals: `hub.ping_seconds = (0.2, 0.2)`, `hub.reread_seconds = 0.2`, and `typing.ttl = 0.2` on an `Ephemeral`. Set them before the first stream opens; the constructor's checks do not run on assignment, so keep `ping_seconds` a `(low, high)` tuple with `0 < low <= high`. Call `typing.reset()` between tests that share an `Ephemeral`. Set `resync_spread=0` if a test expects the re-read after a listener reconnect to come at once.
 
 `next_event` skips pings and the id-only frame that opens a stream with a cursor. Keep that: a ping comes before any frame a re-read produces, because every idle timeout pings, even the one that leads to the re-read, and before a goodbye when the age limit and the ping timeout coincide. A test that expects the very next frame to be the event is flaky without it. Use `next_frame` when the ping or the id is what you are testing.
 
@@ -547,19 +656,19 @@ The exception is `hub.wake`: it reaches only the streams of the process that cal
 
 ## Logging
 
-pg-sse logs to the standard-library logger named `pg_sse` and adds no handlers, so configure it like any other. At `WARNING` it logs a stream refused at a cap or during shutdown (back-pressure, not a fault) and the listener losing its connection (with the traceback and the retry delay). At `ERROR` it logs, with a traceback, a stream whose `read` or `start` raised or returned something other than `Event` items; that stream ends and the client reconnects.
+pg-sse logs to the standard-library logger named `pg_sse` and adds no handlers, so configure it like any other. At `WARNING` it logs a stream refused at a cap or during shutdown (back-pressure, not a fault) and the listener losing its connection (with the traceback and the retry delay). It also warns, at most once a minute, about a client cursor with a line break or NUL (the stream starts from now) and about an id longer than an `IntCursor`'s `max_digits`. At `ERROR` it logs, with a traceback, a stream whose `read` or `start` raised or returned something other than `Event` items (that stream ends and the client reconnects), and an `on_error` callback that failed.
 
 ## Limits
 
 - **LISTEN needs a direct connection.** Behind a transaction-mode pooler (PgBouncer in transaction mode, the pooled connection strings Supabase and Neon give out) LISTEN succeeds and nothing ever arrives; streams then update only on the re-read. Give the hub the direct URL; your queries can still use the pooler.
 - **The cursor sees new rows, not updates.** If a stream must show edits, have `read` return the current state alongside new rows, or use a cursor that moves on update (a version column with `order_column`). If it does not need to show them, stop them from notifying: `trigger_sql(..., on=("insert",))`, or `update_of=(...)` to wake only for edits of the columns a reader shows. Otherwise every update wakes every reader of that key for a read that returns nothing. A write the trigger leaves out never wakes a stream; the stream finds it on its next re-read.
 - **A key is text.** `hub.stream`, `hub.sse`, `hub.subscribe` and `hub.wake` raise a `TypeError` for a key that is not a `str`, because a notification carries the key column as text and an int would subscribe and never wake. Pass `str(room_id)`.
-- **Sync reads run in a thread pool.** A plain-function `read` or `start` runs in asyncio's default executor (`min(32, cpu + 4)` threads), and under Starlette other sync routes share anyio's pool of 40. Hundreds of streams re-reading at once queue behind it. Prefer async `read` and `start` on an `psycopg_pool.AsyncConnectionPool`; see [examples/chat.py](https://github.com/sandhusanthakumar/pg-sse/blob/main/examples/chat.py). Use `functools.partial(read_after, room)` rather than a lambda to keep an async function off the pool.
+- **Sync reads run in a thread pool.** A plain-function `read` or `start` runs in asyncio's default executor (`min(32, cpu + 4)` threads) unless you pass `read_executor`, and under Starlette other sync routes share anyio's pool of 40. Hundreds of streams re-reading at once queue behind it. Prefer async `read` and `start` on an `psycopg_pool.AsyncConnectionPool`; see [examples/chat.py](https://github.com/sandhusanthakumar/pg-sse/blob/main/examples/chat.py). Use `functools.partial(read_after, room)` rather than a lambda to keep an async function off the pool.
 - **`order_column` serialises inserts per key.** The ordering trigger takes `pg_advisory_xact_lock` on the key and holds it until the transaction ends, so every other insert to that key waits for the whole transaction. Two transactions inserting into keys in opposite order can deadlock, and Postgres aborts one of them. Keep the transaction that inserts short, or skip `order_column` and tolerate a late id arriving on the next re-read. The lock is `pg_advisory_xact_lock(hashtext(channel), hashtext(key))`; advisory locks share one namespace per database, so an application taking the same two-int lock would serialise against these inserts, and since `hashtext` is 32-bit two different keys can collide and briefly wait on each other (a delay, never wrong ids).
 - **Ephemeral state is per process.** `hub.ephemeral` keeps its signals in memory: with several workers a signal set on one is invisible to the streams on the others, and a restart loses it. That costs nothing for typing or presence; anything that must be seen everywhere belongs in a table with a trigger.
 - **Per process.** Each worker runs its own listener, which works, but the caps are per process.
 - **The database may be down at startup.** `lifespan` waits up to `listen_timeout` for the first LISTEN and then starts anyway; until the listener connects, streams update on their re-read and `listener_connected` is false.
-- **Disconnect detection depends on the server.** Starlette 1.7 under an ASGI server that advertises `spec_version` 2.4 no longer listens for `http.disconnect` during a streaming response: a dead client is noticed at the next write, at most `ping_seconds[1]` later, and its slot is held until then. uvicorn 0.54 advertises 2.3 and frees the slot at once.
+- **Disconnect detection depends on the server.** Starlette 1.7 under an ASGI server that advertises `spec_version` 2.4 does not listen for `http.disconnect` during a streaming response: a dead client is noticed at the next write, at most `ping_seconds[1]` later, and its slot is held until then. uvicorn 0.54 advertises 2.3 and frees the slot at once.
 - **psycopg 3** for the listener; your own queries can use any driver.
 - **A framework for the response.** `hub.sse` needs Starlette or FastAPI; any other framework uses `hub.stream`.
 
@@ -572,7 +681,7 @@ If you are generating code with this library, follow these rules. [llms.txt](htt
 3. Register the hub with `FastAPI(lifespan=hub.lifespan)`, or `async with hub.lifespan():` inside an existing lifespan.
 4. Call `hub.sse(...)` (Starlette/FastAPI) or `hub.stream(...)` (any framework; catch `TooManySubscribers`) from an `async def` route, after any 404 or permission check.
 5. `read(after)` returns `pg_sse.Event` items **after** the cursor, oldest first, each with `id` set. Use `WHERE id > %s ORDER BY id LIMIT n`.
-6. Parse `Last-Event-ID` before passing it as `cursor`; it is client input.
+6. Parse `Last-Event-ID` before passing it as `cursor`; it is client input. A module-level `IntCursor()`'s `parse_one(header)` returns the int or `None` (start from now; a 422 stops `EventSource` for good); never `str.isdigit()` then `int()`.
 7. Pass `start=` (the current max id) when the stream should start from now. Do not compute it before calling `hub.sse`: that reintroduces a gap.
 8. Prefer async `read` and `start` on a connection pool; plain functions run in a limited thread pool.
 9. In the browser use `EventSource`; it resumes with `Last-Event-ID` by itself.

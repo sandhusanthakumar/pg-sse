@@ -1,6 +1,7 @@
 import json
 import re
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,7 +32,7 @@ def encode(event: Event, default: Callable[[Any], Any] | None = None) -> str:
     """`default` is `json.dumps`'s: what to do with data that is not JSON-native (e.g. `str` for a datetime)."""
     lines = []
     if event.id is not None:
-        lines.append(f"id: {_field('id', str(event.id))}")
+        lines.append(f"id: {id_text(event.id)}")
     if event.event is not None:
         lines.append(f"event: {_field('event', event.event)}")
     data = event.data if isinstance(event.data, str) else json.dumps(event.data, separators=(",", ":"), default=default)
@@ -39,9 +40,9 @@ def encode(event: Event, default: Callable[[Any], Any] | None = None) -> str:
     return "\n".join(lines) + "\n\n"
 
 
-def encode_cursor(cursor: Any) -> str:
-    """An id with no data: the browser records it as its Last-Event-ID and dispatches nothing."""
-    return f"id: {_field('id', str(cursor))}\n\n"
+def encode_cursor(cursor: Any, what: str = "a cursor") -> str:
+    """An id with no data: the browser records it as its Last-Event-ID and dispatches nothing. `what`: see `id_text`."""
+    return f"id: {id_text(cursor, what)}\n\n"
 
 
 def encode_goodbye(event_name: str | None, reason: str, retry_ms: int) -> str:
@@ -57,6 +58,51 @@ def encode_goodbye(event_name: str | None, reason: str, retry_ms: int) -> str:
             f"data: {json.dumps({'reason': reason}, separators=(',', ':'))}",
         ]
     return "\n".join(lines) + "\n\n"
+
+
+def id_text(value: Any, what: str = "a cursor or Event id") -> str:
+    """
+    The SSE id for a cursor. Raw bytes would be sent as `b'42'`, and a collection (a fetched row, what
+    `IntCursor.parse` returns, a set) as `(12, 3)` or `{'id': 12}`: the browser hands that back as its Last-Event-ID,
+    and `IntCursor` then refuses it. `what` names where the value came from, for the error.
+    """
+    if type(value) is int or type(value) is str:  # nearly every id: no further checks on the hot path
+        return _field("id", str(value))
+    if isinstance(value, bool):  # sent as "True", which no reconnect can parse
+        raise TypeError(f"pg_sse: {what} cannot be a bool")
+    if isinstance(value, bytes | bytearray | memoryview):
+        raise TypeError(f"pg_sse: {what} cannot be bytes: pass IntCursor.parse_one(header), which reads them")
+    if isinstance(value, Iterable) and not isinstance(value, str):
+        raise TypeError(
+            f"pg_sse: {what} cannot be a {type(value).__name__}: pass the value itself (row[0], not the row), "
+            "IntCursor.parse_one's int, or IntCursor.format(*values)"
+        )
+    return _field("id", str(value))
+
+
+class Throttle:
+    """For a warning any client can set off: says yes at most once every `seconds`, for the whole process."""
+
+    def __init__(self, seconds: float) -> None:
+        self.seconds = seconds
+        self._last = -seconds
+
+    def ready(self) -> bool:
+        now = time.monotonic()
+        if now - self._last < self.seconds:
+            return False
+        self._last = now
+        return True
+
+
+def check_event_name(cause: str, name: object) -> None:
+    """An event name the encoder accepts, checked where it is given rather than in every stream; None is no event."""
+    if name is not None and not isinstance(name, str):
+        raise TypeError(f"{cause}: an event name must be a str or None; got {name!r}")
+    if name == "":  # the browser would dispatch it as a plain `message`
+        raise ValueError(f"{cause}: an event name must not be empty; pass None to send nothing")
+    if name is not None:
+        _field("event", name)  # a line break or NUL
 
 
 def _field(name: str, value: str) -> str:

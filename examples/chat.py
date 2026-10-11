@@ -24,12 +24,13 @@ from fastapi.responses import HTMLResponse
 from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel
 
-from pg_sse import Event, Hub, trigger_sql
+from pg_sse import Event, Hub, IntCursor, trigger_sql
 
 # The hub needs a direct connection: LISTEN never delivers behind a transaction-mode pooler. The pool may use one.
 DATABASE_URL = os.environ["DATABASE_URL"]
 
 hub = Hub(DATABASE_URL, channel="room_change")
+cursors = IntCursor()
 pool = AsyncConnectionPool(DATABASE_URL, open=False)
 
 SCHEMA = """
@@ -85,8 +86,9 @@ async def index() -> HTMLResponse:
 
 @app.get("/rooms/{room}/stream")
 async def stream(room: str, last_event_id: Annotated[str | None, Header()] = None):
-    # Last-Event-ID is client input: parse it. None starts from now.
-    cursor = int(last_event_id) if last_event_id and last_event_id.isdigit() else None
+    # Last-Event-ID is client input: only digits get through. No header, or one that is not a cursor, starts from
+    # now: EventSource gives up for good on a non-200, so a 422 would end live updates in that tab.
+    cursor = cursors.parse_one(last_event_id)
     # partial, not a lambda: an async function passed directly never touches the thread pool.
     return hub.sse(room, read=partial(read_after, room), cursor=cursor, start=partial(latest_id, room))
 

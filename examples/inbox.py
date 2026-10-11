@@ -16,6 +16,9 @@ Two kinds of wake-up reach `read(cursor, wake)`. A database write arrives as `wa
 not a write: nothing is stored, so `hub.ephemeral` keeps who is typing in memory, wakes the room when that changes and
 wakes it again when a signal lapses. It leaves the inbox alone (`all_keys=False`), which has nothing to show for it.
 
+`signal_read` turns those causes into events: `ready` on the first read, `resync` after a reconnect or a quiet re-read,
+and a name per kind of wake-up. See the README's "Signal streams" for the same thing written out over `Wake`.
+
 Typing lives in this process's memory, and `hub.wake` reaches only this process's streams. With several workers a
 typist's signal would miss the readers on the other workers: keep typing in a shared place (a table with the same
 trigger, or Redis) before you scale out.
@@ -25,14 +28,13 @@ import os
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from functools import partial
 
 import psycopg
 from fastapi import FastAPI
 from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel
 
-from pg_sse import Event, Hub, Wake, trigger_sql
+from pg_sse import Hub, signal_read, trigger_sql
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 TYPING_SECONDS = 8.0  # how long after the last keystroke someone still counts as typing
@@ -73,37 +75,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(lifespan=lifespan)
 
 
-async def room_signals(room: str, cursor: None, wake: Wake) -> list[Event]:
-    """What a page watching one room should refetch. There is no cursor: the events carry no data."""
-    if wake.start:
-        return [Event({}, event="ready")]  # the page loads everything once
-    if wake.resync or wake.reread:
-        return [Event({}, event="resync")]  # anything may have changed: refetch everything
-    events = []
-    if wake.keys:  # a row was inserted into this room
-        events.append(Event({}, event="messages"))
-    if "typing" in wake.signals:
-        events.append(Event({}, event="typing"))
-    return events
-
-
-async def inbox_signals(cursor: None, wake: Wake) -> list[Event]:
-    """What an inbox page watching every room should refetch: the rooms that got a message."""
-    if wake.start:
-        return [Event({}, event="ready")]
-    if wake.resync or wake.reread:
-        return [Event({}, event="resync")]
-    return [Event({"rooms": sorted(wake.keys)}, event="change")] if wake.keys else []
+# A page watching one room: a new message, or a change in who is typing. There is no cursor: the events carry no data.
+room_read = signal_read(change="messages", signals={"typing": "typing"})
+# A page watching every room: which rooms got a message.
+inbox_read = signal_read(change_data=lambda keys: {"rooms": sorted(keys)})
 
 
 @app.get("/rooms/{room}/stream")
 async def room_stream(room: str):
-    return hub.sse(room, read=partial(room_signals, room))
+    return hub.sse(room, read=room_read)
 
 
 @app.get("/inbox/stream")
 async def inbox_stream():
-    return hub.sse(None, read=inbox_signals)  # every key on the channel
+    return hub.sse(None, read=inbox_read)  # every key on the channel
 
 
 class Typing(BaseModel):

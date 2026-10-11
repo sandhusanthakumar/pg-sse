@@ -51,9 +51,9 @@ async def test_a_signal_that_is_not_renewed_lapses(db):
         subscription = hub.subscribe("room")
         typing.set("room", "ann")
         await subscription.wait(1)
-        timers.assert_called_once_with(8.25, typing._check, "room")  # ttl + grace
+        timers.assert_called_once_with(8.25, typing._check, "room", 0)  # ttl + grace, for the first generation
         clock.now += 8
-        typing._check("room")
+        typing._check("room", typing._generation)
         assert await subscription.wait(1) == [("wake", "room", "typing")]
         assert typing.live("room") == []
 
@@ -68,11 +68,11 @@ async def test_a_renewed_signal_survives_the_first_check_and_the_last_check_remo
         await subscription.wait(1)
         assert timers.call_count == 2  # one timer per renewal
         clock.now += 4.5  # the first timer fires: the renewal still has 3.5 s
-        typing._check("room")
+        typing._check("room", typing._generation)
         assert not await woken(subscription)
         assert typing.live("room") == ["ann"]
         clock.now += 4  # the last timer fires
-        typing._check("room")
+        typing._check("room", typing._generation)
         assert await woken(subscription)
         assert typing.live("room") == []
 
@@ -160,8 +160,22 @@ async def test_a_lapse_that_live_has_seen_is_still_announced(db):
         await subscription.wait(1)
         clock.now += 8.1
         assert typing.live("room") == []  # a read between the expiry and the check must not eat the wake
-        typing._check("room")
+        typing._check("room", typing._generation)
         assert await woken(subscription)
+
+
+async def test_reset_forgets_every_key_and_wakes_nobody(db):
+    hub, typing, _, _ = make(db)
+    async with hub.lifespan():
+        subscription = hub.subscribe("room")
+        typing.set("room", "ann")
+        typing.set("other", "bob")
+        await subscription.wait(1)
+        typing.reset()
+        assert typing.live("room") == typing.live("other") == []
+        assert typing._entries == {}
+        assert not await woken(subscription)
+        assert typing.set("room", "ann") is True  # a later signal starts from nothing
 
 
 async def test_the_check_removes_the_keys_entry_when_it_is_empty_and_ignores_an_unknown_key(db):
@@ -169,9 +183,9 @@ async def test_the_check_removes_the_keys_entry_when_it_is_empty_and_ignores_an_
     typing.set("room", "ann")
     assert "room" in typing._entries
     clock.now += 9
-    typing._check("room")
+    typing._check("room", typing._generation)
     assert typing._entries == {}
-    typing._check("room")  # a later timer for the same key finds nothing
+    typing._check("room", typing._generation)  # a later timer for the same key finds nothing
     assert typing.clear("room", "ann") is False
 
 
@@ -214,7 +228,19 @@ async def test_a_key_that_is_not_text_is_refused_like_hub_wake(db):
         typing.set(None, "ann", on=False)  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize(("kwargs", "message"), [({"ttl": 0}, "ttl"), ({"ttl": 1, "grace": -1}, "grace")])
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"ttl": 0}, "ttl"),
+        ({"ttl": float("nan")}, "ttl"),  # `live` would never list anyone, and the lapse timer's deadline is NaN
+        ({"ttl": float("inf")}, "ttl"),
+        ({"ttl": 1, "grace": -1}, "grace"),
+        ({"ttl": 1, "grace": float("nan")}, "grace"),
+        ({"ttl": 1, "grace": float("inf")}, "grace"),
+        ({"ttl": True}, "ttl"),  # an int, but not a duration
+        ({"ttl": "8"}, "ttl"),
+    ],
+)
 def test_bad_settings_are_refused(kwargs, message):
     with pytest.raises(ValueError, match=message):
         Ephemeral(mock.Mock(), "typing", **kwargs)
@@ -242,3 +268,21 @@ async def test_a_read_sees_the_signal_in_wake_signals(db):
         assert "event: typing" in await asyncio.wait_for(first, 2)
         assert frozenset({"typing"}) in seen
         await frames.aclose()
+
+
+async def test_reset_makes_a_check_scheduled_before_it_do_nothing(db):
+    hub, typing, clock, _ = make(db)
+    async with hub.lifespan():
+        subscription = hub.subscribe("room")
+        typing.set("room", "ann")
+        await subscription.wait(1)
+        stale = typing._generation
+        typing.reset()
+        typing.set("room", "bob")
+        await subscription.wait(1)
+        clock.now += 9  # bob has lapsed, and only a check for the new state may say so
+        typing._check("room", stale)
+        assert not await woken(subscription)
+        assert "room" in typing._entries
+        typing._check("room", typing._generation)
+        assert await woken(subscription)
