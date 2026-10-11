@@ -43,7 +43,7 @@ jobs:
     env:
       PG_SSE_TEST_DSN: postgresql://sse:sse@localhost:5432/pg_sse_test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: ${{ matrix.python }}
@@ -61,7 +61,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
       - run: uv build
       - run: uvx twine check dist/*
