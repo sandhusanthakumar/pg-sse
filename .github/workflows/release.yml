@@ -1,6 +1,7 @@
 name: Release
 
-# Push a tag like v0.1.0 to publish to PyPI. Run the workflow by hand ("Run workflow") to publish to TestPyPI instead.
+# Push a tag like v0.1.0 to publish to TestPyPI and then, if that succeeds, to PyPI. Run the workflow by hand ("Run workflow")
+# to publish to TestPyPI only.
 # Both need a trusted publisher for this repository and workflow, and an environment of that name:
 #   PyPI (environment `pypi`): https://docs.pypi.org/trusted-publishers/
 #   TestPyPI (environment `testpypi`): the same, registered at https://test.pypi.org/manage/account/publishing/
@@ -42,38 +43,56 @@ jobs:
       - run: uv run mypy
       - run: uv run pytest --cov --cov-report=term-missing
 
-  publish:
-    if: github.event_name == 'push'
-    needs: test
+  # Built once: TestPyPI and PyPI get the same files, and a tag that does not match the version is refused before either.
+  build:
     runs-on: ubuntu-latest
-    environment: pypi
-    permissions:
-      id-token: write
-      contents: read
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
       - run: uv build
       # The version is `__version__` in src/pg_sse/__init__.py, read at build time, so the built files are the truth.
       - name: Tag matches the built version
+        if: github.event_name == 'push'
         run: |
           version="${GITHUB_REF_NAME#v}"
           test -f "dist/pg_sse-${version}.tar.gz" && test -f "dist/pg_sse-${version}-py3-none-any.whl" && test "$(ls dist | wc -l)" -eq 2
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+          overwrite: true
 
+  # `skip-existing` lets a tag follow a manual run of the same version, so TestPyPI having the version is enough.
   testpypi:
-    if: github.event_name == 'workflow_dispatch'
-    needs: test
+    needs: [test, build]
     runs-on: ubuntu-latest
     environment: testpypi
     permissions:
       id-token: write
       contents: read
     steps:
-      - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v7
-      - run: uv build
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           repository-url: https://test.pypi.org/legacy/
           skip-existing: true
+
+  # A tag publishes to PyPI only after TestPyPI has taken the build.
+  publish:
+    if: github.event_name == 'push'
+    needs: testpypi
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

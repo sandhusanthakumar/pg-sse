@@ -6,7 +6,7 @@ description = "Live updates from the Postgres you already run: LISTEN/NOTIFY wak
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-authors = [{ name = "Sandhu Santhakumar" }]
+authors = [{ name = "Sandhu Santhakumar", email = "code@sandhu.sh" }]
 requires-python = ">=3.11"
 dependencies = [
     "psycopg>=3.2.1",
@@ -33,9 +33,9 @@ starlette = ["starlette>=0.36"]
 fastapi = ["fastapi>=0.110"]
 
 [project.urls]
-Homepage = "https://github.com/sandhusanthakumar/pg-sse"
-Issues = "https://github.com/sandhusanthakumar/pg-sse/issues"
-Changelog = "https://github.com/sandhusanthakumar/pg-sse/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/sansanth/pg-sse"
+Issues = "https://github.com/sansanth/pg-sse/issues"
+Changelog = "https://github.com/sansanth/pg-sse/blob/main/CHANGELOG.md"
 
 [dependency-groups]
 dev = [

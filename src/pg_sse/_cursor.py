@@ -9,7 +9,7 @@ from ._event import Throttle, _field
 logger = logging.getLogger("pg_sse")
 
 # For the whole process, not one `IntCursor`: one made per request must not log on every one.
-_too_long = Throttle(60.0)
+_too_long = Throttle()
 
 # A cursor is an id in Postgres, and bigint is its widest integer: a larger part would fail the query (a 500 on client
 # input) or, sent as numeric, compare without the index.

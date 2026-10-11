@@ -27,6 +27,7 @@ import math
 import numbers
 import random
 import signal
+import sys
 import threading
 import time
 import weakref
@@ -56,6 +57,7 @@ RESYNC = "\x00resync"
 DROPPED = "\x00dropped"
 CLOSING = "\x00closing"
 REVOKED = "\x00revoked"
+RECHECK = "\x00recheck"  # its `revalidate` failed, so the route is asked again
 UNREAD = "\x00unread"  # not read within `_UNREAD_SECONDS` of being made
 AGED = "\x00aged"  # reached its age limit
 QueueItem = tuple[str, ...]
@@ -72,7 +74,7 @@ _BACKOFF_START_SECONDS = 0.5
 _BACKOFF_MAX_SECONDS = 30.0
 # How often the listener wakes from a quiet connection to check whether it was asked to stop.
 _LISTEN_POLL_SECONDS = 1.0
-_bad_cursor = Throttle(60.0)  # the warning for a cursor that cannot be an SSE id: any client can send one
+_bad_cursor = Throttle()  # a cursor that cannot be an SSE id: any client can send one
 # How long a client refused at a cap waits before it retries (the 503's Retry-After).
 _RETRY_AFTER_SECONDS = 30
 # A server reads a stream as soon as it sends the response. One never read (the route raised after making it, or the
@@ -100,6 +102,24 @@ _NOT_THREADS = tuple(
 
 STREAM_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
+
+def event_stream_responses(status_code: int = 200, description: str | None = None) -> dict[int | str, dict[str, Any]]:
+    """
+    A new dict for FastAPI's `responses=`, so the OpenAPI document shows what `hub.sse` sends: `text/event-stream` and
+    its headers, under `status_code` for a route that sets another one. Use it with `response_class=StreamingResponse`:
+    without that FastAPI lists `application/json` for the route as well. A new dict each time, to add responses to.
+    Without a `description`, a route's `response_description` applies to its own status code. The headers are the
+    standard ones; `hub.sse(headers=...)` can add to or replace them, and the 503 for a refused stream is not listed.
+    """
+    response: dict[str, Any] = {
+        "content": {"text/event-stream": {}},
+        "headers": {name: {"schema": {"type": "string"}} for name in STREAM_HEADERS},
+    }
+    if description is not None:
+        response["description"] = description
+    return {status_code: response}
+
+
 # Each end marker's rank, goodbye reason, and how long the goodbye tells the client to wait before reconnecting (ms;
 # None: jittered, `_SHUTDOWN_RETRY_MS`). A stronger end replaces a weaker one not said yet: a stream dropped for falling
 # behind may still be in its read, and closed it does not send what that read found; shutdown replaces a revoke or the
@@ -108,10 +128,11 @@ STREAM_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 _ENDS: dict[str | None, tuple[int, str, int | None]] = {
     None: (0, "", None),
     DROPPED: (1, "behind", 1000),
-    AGED: (2, "max_age", 1000),
-    REVOKED: (2, "revoked", 1000),
-    CLOSING: (3, "shutdown", None),
-    UNREAD: (3, "", None),  # no goodbye: it never streamed
+    RECHECK: (2, "recheck", None),  # below a revoke, the age limit and shutdown, which say more
+    AGED: (3, "max_age", 1000),
+    REVOKED: (3, "revoked", 1000),
+    CLOSING: (4, "shutdown", None),
+    UNREAD: (4, "", None),  # no goodbye: it never streamed
 }
 _RETRY_MS = {reason: retry_ms for _, reason, retry_ms in _ENDS.values() if reason}
 _SHUTDOWN_RETRY_MS = (1000, 5000)  # jittered, so a deploy's reconnects are spread out
@@ -119,6 +140,9 @@ _SHUTDOWN_RETRY_MS = (1000, 5000)  # jittered, so a deploy's reconnects are spre
 # The types of `read` and `start`, public so a helper that wraps `hub.sse` can annotate them.
 Read = Callable[..., Iterable[Event] | Awaitable[Iterable[Event]]]  # read(cursor) or read(cursor, wake)
 Start = Callable[[], Any]  # start() gives the current cursor; plain or async
+# `await revalidate()` says whether a stream may go on. Checked when the stream is made: an `async def`, a partial of
+# one, a bound async method or an object with an async `__call__`, not a lambda that returns a coroutine.
+Revalidate = Callable[[], Awaitable[Any]]
 
 
 class TooManySubscribers(Exception):
@@ -133,6 +157,7 @@ class EndedTotals:
     shutdown: int = 0
     revoked: int = 0
     behind: int = 0
+    recheck: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,10 +171,12 @@ class HubStats:
     - `listener_connected`: the listener holds its LISTEN right now.
     - `listener_reconnects_total`: how often the listener got its connection back after losing it.
     - `last_notification_at`: Unix time of the last notification the listener received, or None if none yet.
-    - `read_errors_total`: streams that failed: `read` or `start` raised, or `read` returned something the hub could not
-      send (not an `Event`, data `json.dumps` refuses, a tuple id).
+    - `read_errors_total`: streams that failed: `read` or `start` raised, or `read` returned something the hub could
+      not send (not an `Event`, data `json.dumps` refuses, a tuple id).
+    - `revalidate_errors_total`: runs of a stream's `revalidate` that raised or timed out, and checks that stopped
+      for good. A stream they ended is counted in `ended_total.recheck`, not in `read_errors_total`.
     - `ended_total`: goodbyes sent, by reason. A stream whose client left, or that ended with a `final` event or a
-      failure, sent none.
+      failed `read` or `start`, sent none.
     """
 
     open_streams: int
@@ -160,19 +187,26 @@ class HubStats:
     last_notification_at: float | None
     read_errors_total: int = 0
     ended_total: EndedTotals = EndedTotals()
+    revalidate_errors_total: int = 0
 
 
 @dataclass(frozen=True, slots=True)
 class StreamInfo:
     """
-    One subscription still holding its slot, from `hub.streams()`: what it watches, its owner, how long it has been
-    open, and whether it ended (closed or dropped) and is only saying goodbye.
+    One subscription still holding its slot, from `hub.streams()` (and as the third argument of an `on_error` that takes
+    one): what it watches, its owner, how long it has been open, and whether it ended (closed or dropped) and is only
+    saying goodbye.
     """
 
     key: str | None
     owner: str | None
     age_seconds: float
     ended: bool = False
+
+
+_Reported = Awaitable[None] | None
+# on_error(key, exc), or on_error(key, exc, info) with the stream's StreamInfo
+ErrorHandler = Callable[[str | None, Exception], _Reported] | Callable[[str | None, Exception, StreamInfo], _Reported]
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,6 +249,7 @@ class _StreamSpec:
     start: Start | None
     end_event: str | None
     age_limit: float
+    revalidate: Revalidate | None
 
 
 class Subscription:
@@ -254,6 +289,7 @@ class Subscription:
         self.release_timer: asyncio.TimerHandle | None = None
         # A resync is a flag, not a queued item: it takes no slot, so it never ends a stream that is only busy.
         self.resync_pending = False
+        self.watch: asyncio.Task[None] | None = None  # runs its `revalidate` about every `revalidate_seconds`
 
     def offer(self, item: QueueItem) -> bool:
         """Queues a wake-up. False when the queue was full, so this call ended the stream instead."""
@@ -354,7 +390,11 @@ class Hub:
         resync_spread: float = 2.0,
         application_name: str = "pg-sse-listener",
         read_executor: concurrent.futures.Executor | None = None,
-        on_error: Callable[[str | None, Exception], Awaitable[None] | None] | None = None,
+        on_error: ErrorHandler | None = None,
+        log_owner: bool = False,
+        revalidate_seconds: float = 15.0,
+        revalidate_failures: int | None = 3,
+        revalidate_timeout: float = 10.0,
     ) -> None:
         if not channel or "\x00" in channel or len(channel.encode()) > 63:
             raise ValueError("channel must be a non-empty identifier of at most 63 bytes")
@@ -374,13 +414,19 @@ class Hub:
             raise ValueError("ping_seconds must be (low, high) with low <= high")
         reread_seconds = _seconds("reread_seconds", reread_seconds, infinite=True)
         resync_spread = _seconds("resync_spread", resync_spread, zero=True)
+        revalidate_seconds = _seconds("revalidate_seconds", revalidate_seconds)
+        revalidate_timeout = _seconds("revalidate_timeout", revalidate_timeout)
+        if revalidate_failures is not None and (
+            not isinstance(revalidate_failures, int) or isinstance(revalidate_failures, bool) or revalidate_failures < 1
+        ):
+            raise ValueError("revalidate_failures must be an int, at least 1, or None for no limit")
         if listen_timeout is not None:
             listen_timeout = _seconds("listen_timeout", listen_timeout, zero=True)
         check_event_name("end_event", end_event)  # here, not at the first goodbye, where nothing can report it
-        if on_error is not None and not callable(on_error):
-            raise TypeError(f"on_error must be a function of (key, exc); got {on_error!r}")
         if not application_name or "\x00" in application_name:
             raise ValueError("application_name must be non-empty text")
+        if not isinstance(log_owner, bool):
+            raise TypeError(f"log_owner must be True or False; got {log_owner!r}")
         if isinstance(read_executor, _NOT_THREADS):
             # A read runs with the caller's context variables, which, like a lambda, cannot leave this interpreter.
             raise ValueError("read_executor must run threads (a ThreadPoolExecutor), not processes or interpreters")
@@ -409,9 +455,9 @@ class Hub:
         self.reread_seconds = reread_seconds
         # Passed to `json.dumps(default=...)` for Event data that is not JSON-native, e.g. `str` for datetimes.
         self.json_default = json_default
-        # Before a planned close (age limit, shutdown, revoked, fell behind) a stream always sends `retry:`, which
-        # EventSource applies by itself. With a name here it also sends that event with {"reason": ...}, for clients
-        # that are not EventSource and want to know why.
+        # Before a planned close (age limit, shutdown, revoked, recheck, fell behind) a stream always sends `retry:`,
+        # which EventSource applies by itself. With a name here it also sends that event with {"reason": ...}, for
+        # clients that are not EventSource and want to know why.
         self.end_event = end_event
         self.handle_signals = handle_signals
         # How long `lifespan` waits for the first LISTEN before it lets the app start, so a health check and the first
@@ -428,10 +474,29 @@ class Hub:
         # The thread pool a plain (not async) `read` or `start` runs in: asyncio's default pool (at most 32 threads,
         # shared with everything else that uses it) when None. The hub never shuts a given executor down.
         self.read_executor = read_executor
-        # Called as `on_error(key, exc)` when a stream fails (as `HubStats.read_errors_total` counts), after it is
-        # logged: a plain function in asyncio's default pool, an async one on the loop, either as its own task, so a
-        # slow error tracker holds up nothing else.
+        # Called as `on_error(key, exc)` when a stream fails (as `HubStats.read_errors_total` counts) and when a failing
+        # `revalidate` ends one, after it is logged: a plain function in asyncio's default pool, an async one on the
+        # loop, either as its own task, so a slow error tracker holds up nothing else. One that takes a third argument
+        # gets the stream's `StreamInfo`. (The log line for a stream `revalidate` ended is said once a minute; the call
+        # is made for each.)
+        if on_error is not None:
+            _check_on_error(on_error)
         self.on_error = on_error
+        # Whether the log line for a failed stream names its owner. Off unless asked for, since an owner may be a
+        # session token or an address that must stay out of the logs; `on_error` gets it either way.
+        self.log_owner = log_owner
+        # About how long a stream waits between two runs of its `revalidate` (jittered, like the pings), how long one
+        # run may take, and how many runs in a row must fail to end the stream with `recheck`, so a check that raises
+        # when it should say no cannot leave a revoked session its stream. None: none does, which suits clients that
+        # do not come back through a route that needs the same store as the check.
+        self.revalidate_seconds = revalidate_seconds
+        self.revalidate_timeout = revalidate_timeout
+        self.revalidate_failures = revalidate_failures
+        self._revalidate_errors = 0
+        # The log lines for a failed `revalidate`, one that does not end its stream and one that does. When the session
+        # store goes down every stream has one of each, so each is said once a minute for the hub.
+        self._revalidate_blip = Throttle()
+        self._revalidate_ended = Throttle()
         self._loop: asyncio.AbstractEventLoop | None = None
         # Every subscription not unsubscribed yet, and the same ones indexed: by key and the ones watching every key,
         # for fan-out (a notification costs the streams it reaches, not every open stream), and by owner, for the
@@ -470,6 +535,7 @@ class Hub:
             last_notification_at=self._last_notification_at,
             read_errors_total=self._read_errors,
             ended_total=EndedTotals(**self._ended),
+            revalidate_errors_total=self._revalidate_errors,
         )
 
     def streams(self) -> list[StreamInfo]:
@@ -482,7 +548,11 @@ class Hub:
         """
         now = time.monotonic()
         found = sorted(self._subscriptions, key=lambda s: s.opened_at)
-        return [StreamInfo(s.key, s.owner, now - s.opened_at, s.ended) for s in found]
+        return [self._info(s, now) for s in found]
+
+    @staticmethod
+    def _info(subscription: Subscription, now: float) -> StreamInfo:
+        return StreamInfo(subscription.key, subscription.owner, now - subscription.opened_at, subscription.ended)
 
     def stream(
         self,
@@ -494,6 +564,7 @@ class Hub:
         owner: str | int | None = None,
         end_event: str | None = None,
         max_stream_seconds: float | None = None,
+        revalidate: Revalidate | None = None,
     ) -> AsyncIterator[str]:
         """
         The encoded SSE frames for one key (None: every key on the channel), for any framework to send as
@@ -512,6 +583,18 @@ class Hub:
         - `end_event`, when given, overrides the hub's: the event name sent with the reason before a planned close.
         - `max_stream_seconds`, when given, overrides the hub's age limit for this stream: a visitor's stream may
           expire sooner than a dashboard session's.
+        - `await revalidate()` says whether the stream may go on: True to keep it, anything falsy (None too) to end
+          it with the goodbye `revoked`, so a removed member or a signed-out session loses its stream without a
+          `hub.close` at every place that revokes. Return False for a session that is gone; raise only when the check
+          could not be made (a helper that raises to deny is a failure, not a no). It runs about every
+          `revalidate_seconds`, on its own clock, the first time about that long after the stream is first read (the
+          route has just checked), in a task of its own with the context variables of the task that reads it, for
+          every open stream: make it a cached lookup. It runs on the event loop, so it must be async: an `async def`,
+          a `functools.partial` of one (not a lambda, which cannot be told from one that blocks), a bound async method
+          or an object with an async `__call__`; anything else is a `TypeError`. A failure (it raises or runs over
+          `revalidate_timeout`) warns and is counted in `HubStats.revalidate_errors_total`; `revalidate_failures` in
+          a row end the stream with the goodbye `recheck`, and the client reconnects after a jittered delay, through
+          the route's own check.
 
         Call it from the event loop, after any 404 or permission check: the stream takes its slot here, so
         `TooManySubscribers` is raised before any response exists. It gives the slot back when it ends, however it ends,
@@ -528,6 +611,7 @@ class Hub:
             owner=owner,
             end_event=end_event,
             max_stream_seconds=max_stream_seconds,
+            revalidate=revalidate,
         )[1]
 
     def _stream(
@@ -540,6 +624,7 @@ class Hub:
         owner: str | int | None,
         end_event: str | None,
         max_stream_seconds: float | None,
+        revalidate: Revalidate | None,
     ) -> tuple[Subscription, AsyncIterator[str]]:
         """`stream`, with the subscription, for a caller that must give its slot back if what it builds fails."""
         if end_event is None:
@@ -551,6 +636,8 @@ class Hub:
         else:
             age_limit = _seconds("max_stream_seconds", max_stream_seconds, infinite=True)
         _check_read(read)
+        if revalidate is not None:
+            _check_revalidate(revalidate)
         # A cursor the browser could not hand back fails here, not on every reconnect: of the wrong type (a row, bytes)
         # it is the code's mistake, and raises. Text with a line break or NUL is the client's, as from a raw query
         # parameter: the stream starts from now, as `IntCursor.parse_one` does for a header that is not a cursor, and
@@ -574,6 +661,7 @@ class Hub:
             start=start,
             end_event=end_event,
             age_limit=age_limit,
+            revalidate=revalidate,
         )
         subscription = self._subscribe(key, owner, hub_stream=True)
         frames = self._events(subscription, spec)
@@ -593,6 +681,7 @@ class Hub:
         owner: str | int | None = None,
         end_event: str | None = None,
         max_stream_seconds: float | None = None,
+        revalidate: Revalidate | None = None,
         headers: Mapping[str, str] | None = None,
         refuse_with: Callable[[TooManySubscribers], Exception] | None = None,
     ) -> "StreamingResponse":
@@ -602,6 +691,9 @@ class Hub:
 
         `refuse_with` replaces that 503: it gets the `TooManySubscribers` and returns the exception to raise instead,
         e.g. one your error tracker is set to ignore, since a refused stream is back-pressure, not a fault.
+
+        FastAPI's OpenAPI document does not know the response: pass `responses=pg_sse.event_stream_responses()` and
+        `response_class=StreamingResponse` to the route.
         """
         try:
             from starlette.exceptions import HTTPException
@@ -617,6 +709,7 @@ class Hub:
                 owner=owner,
                 end_event=end_event,
                 max_stream_seconds=max_stream_seconds,
+                revalidate=revalidate,
             )
         except TooManySubscribers as err:
             logger.warning("pg_sse refused a stream (%s)", err)
@@ -636,7 +729,6 @@ class Hub:
             raise
 
     async def _events(self, subscription: Subscription, spec: _StreamSpec) -> AsyncIterator[str]:
-        key = subscription.key
         try:
             reason = None  # of the goodbye to say, if it ends with one
             try:
@@ -656,9 +748,9 @@ class Hub:
             except _Goodbye as goodbye:
                 reason = goodbye.reason
             except Exception as err:
-                logger.exception("pg_sse stream for key %r failed; the client reconnects", key)
                 self._read_errors += 1
-                self._report(key, err)
+                self._log_failure(subscription, err)
+                self._report(subscription, err)
             if reason:  # empty for a stream never read: it never streamed, so it just ends
                 # The slot is held until the client took this too: one that stopped reading keeps counting.
                 yield _goodbye(spec.end_event, reason)
@@ -674,6 +766,11 @@ class Hub:
         subscription.release_timer = _cancel(subscription.release_timer)  # being read, however long `start` takes
         read, wants_wake, cursor, first_frame = spec.read, spec.wants_wake, spec.cursor, spec.first_frame
         deadline = time.monotonic() + spec.age_limit
+        if spec.revalidate is not None:
+            # From here, so one that hangs in `start` or in its first frame is checked too. The route has just checked:
+            # the first check is due one interval on. Its own task, with this one's context variables.
+            subscription.watch = asyncio.ensure_future(self._watch(subscription, spec.revalidate))
+            subscription.watch.add_done_callback(functools.partial(self._watch_done, subscription))
         if cursor is None and spec.start is not None:
             cursor = await self._app_call(subscription, spec.start)
             if cursor is not None:
@@ -732,6 +829,93 @@ class Hub:
                     wake = _wake_from(woke)
                     break
 
+    async def _watch(self, subscription: Subscription, revalidate: Revalidate) -> None:
+        """
+        Runs the app's `revalidate` about every `revalidate_seconds` for as long as the stream lasts, on its own clock,
+        so a quiet stream, a stream in a read and a slow check do not hold each other up. A no ends the stream as
+        `hub.close` does. A check that raises or takes too long is a failure; `revalidate_failures` in a row end the
+        stream with `recheck`: its client comes back through the route after a jittered delay, instead of every stream
+        failing at the same moment. A stream that ended before its check ran is left alone; a no replaces a weaker end.
+        """
+        failures = 0
+        while True:
+            # Jittered, so streams opened together (a deploy's reconnects) do not check, and fail, in step.
+            await asyncio.sleep(self.revalidate_seconds * random.uniform(0.75, 1.25))  # noqa: S311
+            if subscription.ended or subscription not in self._subscriptions:  # ended, or its client left
+                return
+            error: Exception | None = None
+            limit = asyncio.timeout(self.revalidate_timeout)
+            try:
+                async with limit:
+                    allowed = bool(await revalidate())
+                if limit.expired():  # a check that swallowed the cancel of the timeout, and answered
+                    raise TimeoutError
+            except BaseException as err:
+                if isinstance(err, KeyboardInterrupt | SystemExit | GeneratorExit) or (
+                    isinstance(err, asyncio.CancelledError) and _cancelling()
+                ):
+                    raise  # the process is stopping, or `_forget` ended the watch
+                if limit.expired():  # our limit, not a timeout of the app's own: that one keeps its message
+                    error = TimeoutError(f"revalidate took more than {self.revalidate_timeout:g} s")
+                elif isinstance(err, Exception):
+                    error = err
+                else:  # a cancel the check raised itself, or an exception type of the app's own that is no Exception
+                    error = RuntimeError(f"revalidate raised {err!r}")
+            if _cancelling():  # `_forget` cancelled the watch, and the check ended without letting it show
+                return
+            if error is None:
+                failures = 0
+                if not allowed:
+                    # As `hub.close` does: it replaces a weaker end, and leaves a stronger one.
+                    self._end_stream(subscription, REVOKED)
+                    return
+                continue
+            if subscription.ended:  # a check that failed because its stream was closed
+                return
+            self._revalidate_errors += 1
+            failures += 1
+            if self.revalidate_failures is not None and failures >= self.revalidate_failures:
+                self._recheck(subscription, error, f"its revalidate failed {failures} times in a row")
+                return
+            if self._revalidate_blip.ready():
+                logger.warning(
+                    "pg_sse revalidate failed for key %r (%d in a row, trying again in about %g s): %r",
+                    subscription.key,
+                    failures,
+                    self.revalidate_seconds,
+                    error,
+                    exc_info=error,
+                )
+
+    def _recheck(self, subscription: Subscription, error: Exception, why: str) -> None:
+        """
+        Ends the stream with `recheck`: its client comes back through the route. The callers count the failure in
+        `revalidate_errors_total`; the log line is said once a minute for the hub, `on_error` hears of each.
+        """
+        self._end_stream(subscription, RECHECK)
+        if self._revalidate_ended.ready():
+            self._log_failure(subscription, error, f"ended: {why}")
+        self._report(subscription, error)
+
+    def _watch_done(self, subscription: Subscription, watch: "asyncio.Future[None]") -> None:
+        """
+        A watch that stopped while its stream goes on, because something in it broke, so the stream is no longer
+        checked: with a failure limit it ends with `recheck`; without one (`None`: failures never end a stream) it
+        only warns. Not one that ended its stream, or that `_forget` cancelled.
+        """
+        error = None if watch.cancelled() else watch.exception()  # read, so asyncio does not warn it was never
+        if subscription.ended or subscription not in self._subscriptions:
+            return
+        if not isinstance(error, Exception):
+            error = RuntimeError("the revalidate check stopped")
+        self._revalidate_errors += 1
+        if self.revalidate_failures is not None:
+            self._recheck(subscription, error, "its revalidate broke")
+        elif self._revalidate_blip.ready():
+            logger.warning(
+                "pg_sse revalidate stopped for key %r, so it is no longer checked: %r", subscription.key, error
+            )
+
     async def _app_call(
         self, subscription: Subscription, fn: Callable[..., Any], *args: Any, is_async: bool | None = None
     ) -> Any:
@@ -774,12 +958,24 @@ class Hub:
         subscription._close(UNREAD)
         self._forget(subscription)
 
-    def _report(self, key: str | None, err: Exception) -> None:
-        if self.on_error is None:
+    def _log_failure(self, subscription: Subscription, err: BaseException, what: str = "failed") -> None:
+        detail = f"open {time.monotonic() - subscription.opened_at:.0f} s"
+        if self.log_owner and subscription.owner is not None:
+            detail = f"owner {subscription.owner!r}, {detail}"
+        logger.error(
+            "pg_sse stream for key %r (%s) %s; the client reconnects", subscription.key, detail, what, exc_info=err
+        )
+
+    def _report(self, subscription: Subscription, err: Exception) -> None:
+        handler = self.on_error
+        if handler is None:
             return
+        args: tuple[Any, ...] = (subscription.key, err)
+        if _accepts_info(handler):
+            args += (self._info(subscription, time.monotonic()),)
         # As a task, and a plain function in asyncio's default pool: a slow error tracker holds up neither this stream's
         # end nor the loop. Not in `read_executor`, where in an outage it would queue behind the very reads failing.
-        task = asyncio.ensure_future(_call(self.on_error, key, err))
+        task = asyncio.ensure_future(_call(handler, *args))
         self._error_reports.add(task)  # a task nothing references can be garbage-collected while it runs
         task.add_done_callback(self._report_done)
 
@@ -832,6 +1028,8 @@ class Hub:
             self._by_owner_key.setdefault((subscription.owner, subscription.key), set()).add(subscription)
 
     def _forget(self, subscription: Subscription) -> None:
+        if subscription.watch is not None:
+            subscription.watch.cancel()
         subscription.resync_timer = _cancel(subscription.resync_timer)
         subscription.release_timer = _cancel(subscription.release_timer)
         self._subscriptions.discard(subscription)
@@ -1257,6 +1455,12 @@ class _Goodbye(Exception):
         self.reason = reason
 
 
+def _cancelling() -> bool:
+    """Whether this task has been asked to stop, as `_forget` does a stream's watch."""
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
+
+
 def _stop_if_closed(subscription: Subscription) -> None:
     """Ended by `hub.close` or shutdown, so what a running read found is not sent. A stream dropped for falling behind
     is not: it sends what it read before its goodbye."""
@@ -1308,21 +1512,77 @@ def _check_read(read: object) -> None:
         raise TypeError(f"pg_sse: read must be a function of the cursor (and the wake); got {read!r}")
 
 
-def _accepts_wake(fn: Callable[..., Any]) -> bool:
-    """
-    Whether `read` is read(cursor, wake): its second positional parameter is named `wake` or has no default. A
-    defaulted second parameter of another name (`limit=500`) is not a wake, and neither is `*args`. Handles lambdas,
-    partials (their bound arguments are gone from the signature) and methods.
-    """
+def _signature(fn: Callable[..., Any]) -> inspect.Signature | None:
+    """`fn`'s signature, or None if it has none (some builtins)."""
     try:
-        parameters = inspect.signature(fn).parameters.values()
-    except (TypeError, ValueError):  # no signature available (some builtins): assume read(cursor)
+        if sys.version_info >= (3, 14):
+            # An annotation naming something imported only for type checking is a name, not an error: only the
+            # parameters matter here.
+            import annotationlib
+
+            return inspect.signature(fn, annotation_format=annotationlib.Format.FORWARDREF)
+        return inspect.signature(fn)
+    except (TypeError, ValueError):  # no signature
+        return None
+
+
+def _can_be_called(fn: Callable[..., Any], *argument_lists: tuple[None, ...]) -> bool:
+    """Whether `fn` can be called with one of the argument lists. Without a signature the first call tells."""
+    signature = _signature(fn)
+    if signature is None:
+        return True
+    for arguments in argument_lists:
+        try:
+            signature.bind(*arguments)
+        except TypeError:
+            continue
+        return True
+    return False
+
+
+def _check_revalidate(revalidate: object) -> None:
+    """
+    A `revalidate` that is not async would block the loop, and one that needs arguments would fail at its first check,
+    long after the route: refused where the stream is made.
+    """
+    if not (callable(revalidate) and _is_async(revalidate) and _can_be_called(revalidate, ())):
+        raise TypeError(
+            "pg_sse: revalidate must be an async function of no arguments (an `async def`, or a `functools.partial` "
+            f"of one): it runs on the event loop; got {revalidate!r}"
+        )
+
+
+def _check_on_error(handler: object) -> None:
+    """An `on_error` that takes neither `(key, exc)` nor `(key, exc, info)` would fail at its first report."""
+    if not (callable(handler) and _can_be_called(handler, (None, None), (None, None, None))):
+        raise TypeError(f"on_error must be a function of (key, exc) or (key, exc, info); got {handler!r}")
+
+
+def _takes_argument(fn: Callable[..., Any], index: int, name: str) -> bool:
+    """
+    Whether `fn` takes a positional parameter number `index` (from 0) that is named `name` or has no default. A
+    defaulted one of another name is the app's own (`limit=500`), and `*args` is not one. Handles lambdas, partials
+    (their bound arguments are gone from the signature) and methods; without a signature it says no.
+    """
+    signature = _signature(fn)
+    if signature is None:
         return False
-    positional = [p for p in parameters if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
-    if len(positional) < 2:
+    kinds = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    positional = [p for p in signature.parameters.values() if p.kind in kinds]
+    if len(positional) <= index:
         return False
-    second = positional[1]
-    return second.name == "wake" or second.default is second.empty
+    parameter = positional[index]
+    return parameter.name == name or parameter.default is parameter.empty
+
+
+def _accepts_wake(fn: Callable[..., Any]) -> bool:
+    """Whether `read` is read(cursor, wake). Without a signature it is assumed to be read(cursor)."""
+    return _takes_argument(fn, 1, "wake")
+
+
+def _accepts_info(fn: Callable[..., Any]) -> bool:
+    """Whether `on_error` is on_error(key, exc, info)."""
+    return _takes_argument(fn, 2, "info")
 
 
 def _is_async(fn: Callable[..., Any]) -> bool:

@@ -1,6 +1,6 @@
 # Contributing
 
-The library is small (about 2,200 lines in `src/pg_sse/`). Read `README.md` and `src/pg_sse/_hub.py` first.
+The library is small (about 2,500 lines in `src/pg_sse/`). Read `README.md` and `src/pg_sse/_hub.py` first.
 
 ## Set up
 
@@ -30,8 +30,9 @@ CI runs the same on Python 3.11-3.14, Postgres 14 and 18, and the lowest support
 
 The version is `__version__` in `src/pg_sse/__init__.py` and nowhere else: Hatch reads it at build time. To release,
 bump it, move the Unreleased entries in `CHANGELOG.md` under a dated heading (and fix the compare links at the
-bottom), run `uv lock`, commit, and push a tag `v<version>`. The release workflow refuses a tag that does not match
-the built files.
+bottom), run `uv lock`, commit, and push a tag `v<version>`. The release workflow builds once and refuses a tag that
+does not match the built files. It then uploads that build to TestPyPI and, once that has taken it, to PyPI, so both
+need a trusted publisher and an environment (`testpypi`, `pypi`), as the comment at the top of `release.yml` says.
 
 ## Style
 

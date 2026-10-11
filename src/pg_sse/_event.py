@@ -80,10 +80,14 @@ def id_text(value: Any, what: str = "a cursor or Event id") -> str:
     return _field("id", str(value))
 
 
-class Throttle:
-    """For a warning any client can set off: says yes at most once every `seconds`, for the whole process."""
+# Log lines that many callers set off at once (every client, every stream) are said once a minute.
+LOG_EVERY_SECONDS = 60.0
 
-    def __init__(self, seconds: float) -> None:
+
+class Throttle:
+    """For a log line many callers can set off at once: says yes at most once every `seconds`, to whoever asks first."""
+
+    def __init__(self, seconds: float = LOG_EVERY_SECONDS) -> None:
         self.seconds = seconds
         self._last = -seconds
 

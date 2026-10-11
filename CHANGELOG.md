@@ -5,6 +5,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-12
+
+### Added
+
+- `revalidate=` on `hub.stream` and `hub.sse`: an async check (type `pg_sse.Revalidate`) that ends a stream with
+  `revoked` when it says no. It runs about every `Hub(revalidate_seconds=15)`; a run over `Hub(revalidate_timeout=10)`
+  counts as failed.
+- `Hub(revalidate_failures=3)`: that many failed checks in a row end the stream with the new goodbye `recheck`
+  (`None`: never). `HubStats.revalidate_errors_total` counts failed checks.
+- `pg_sse.event_stream_responses()` gives FastAPI's `responses=` for a stream route (use it with
+  `response_class=StreamingResponse`), so the OpenAPI document shows `text/event-stream` and the no-cache headers.
+- `on_error` may take a third argument, `on_error(key, exc, info)`, the stream's `StreamInfo` with its `owner` and
+  `age_seconds` (`pg_sse.ErrorHandler` types it). A two-argument `on_error` is called as before.
+- `Hub(log_owner=True)` adds the owner to the log line for a failed stream. Off by default.
+
+### Changed
+
+- `Hub(on_error=...)` raises `TypeError` when the hub is made if the function takes neither `(key, exc)` nor
+  `(key, exc, info)`; it used to fail at its first report. The failed-stream log line also says how long it was open.
+- `EndedTotals` has a `recheck` field and `HubStats` a `revalidate_errors_total` field, so `dataclasses.asdict` of the
+  stats has two new keys.
+
+### Fixed
+
+- On Python 3.14, a `read(after, wake: Wake)` annotated with a name imported only for type checking raised `NameError`
+  when its stream was made, instead of getting its `Wake`.
+
 ## [0.3.0] - 2026-10-11
 
 ### Added
@@ -149,7 +176,8 @@ First release.
   than `queue_size` distinct keys or signals arrive during one read.
 - Python 3.11+, Postgres 14+, psycopg 3.
 
-[Unreleased]: https://github.com/sandhusanthakumar/pg-sse/compare/v0.3.0...HEAD
-[0.3.0]: https://github.com/sandhusanthakumar/pg-sse/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/sandhusanthakumar/pg-sse/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/sandhusanthakumar/pg-sse/releases/tag/v0.1.0
+[Unreleased]: https://github.com/sansanth/pg-sse/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/sansanth/pg-sse/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/sansanth/pg-sse/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/sansanth/pg-sse/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/sansanth/pg-sse/releases/tag/v0.1.0
