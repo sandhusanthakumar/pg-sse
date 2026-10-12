@@ -26,7 +26,9 @@ import logging
 import math
 import numbers
 import random
+import selectors
 import signal
+import socket
 import sys
 import threading
 import time
@@ -72,8 +74,6 @@ _CONNECT_TIMEOUT_SECONDS = 10
 _STATEMENT_TIMEOUT = "30s"
 _BACKOFF_START_SECONDS = 0.5
 _BACKOFF_MAX_SECONDS = 30.0
-# How often the listener wakes from a quiet connection to check whether it was asked to stop.
-_LISTEN_POLL_SECONDS = 1.0
 _bad_cursor = Throttle()  # a cursor that cannot be an SSE id: any client can send one
 # How long a client refused at a cap waits before it retries (the 503's Retry-After).
 _RETRY_AFTER_SECONDS = 30
@@ -395,6 +395,7 @@ class Hub:
         revalidate_seconds: float = 15.0,
         revalidate_failures: int | None = 3,
         revalidate_timeout: float = 10.0,
+        listen_poll_seconds: float = 1.0,
     ) -> None:
         if not channel or "\x00" in channel or len(channel.encode()) > 63:
             raise ValueError("channel must be a non-empty identifier of at most 63 bytes")
@@ -416,6 +417,7 @@ class Hub:
         resync_spread = _seconds("resync_spread", resync_spread, zero=True)
         revalidate_seconds = _seconds("revalidate_seconds", revalidate_seconds)
         revalidate_timeout = _seconds("revalidate_timeout", revalidate_timeout)
+        listen_poll_seconds = _seconds("listen_poll_seconds", listen_poll_seconds)
         if revalidate_failures is not None and (
             not isinstance(revalidate_failures, int) or isinstance(revalidate_failures, bool) or revalidate_failures < 1
         ):
@@ -509,8 +511,12 @@ class Hub:
         self._watching_all: set[Subscription] = set()
         self._by_owner: dict[str, set[Subscription]] = {}
         self._by_owner_key: dict[tuple[str, str | None], set[Subscription]] = {}  # for `max_per_owner`
+        # How long a quiet listener waits before it looks at its stop flag and runs its keepalive check. `stop` wakes
+        # it at once, so this is only the fallback.
+        self.listen_poll_seconds = listen_poll_seconds
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._wake: socket.socket | None = None  # closed by `stop`, which makes the listener's end readable
         # Set while the listener holds a LISTEN: report it from a health check.
         self.listening = threading.Event()
         self.closing = False
@@ -1282,8 +1288,11 @@ class Hub:
         # One flag per start, held by its own thread: a listener that `stop` gave up waiting for (a hung connect) must
         # never see the flag of a later start cleared and resume.
         self._stop = threading.Event()
+        wake_read, self._wake = socket.socketpair()
         self.closing = False
-        self._thread = threading.Thread(target=self._listen, args=(self._stop,), name="pg-sse-listener", daemon=True)
+        self._thread = threading.Thread(
+            target=self._listen, args=(self._stop, wake_read), name="pg-sse-listener", daemon=True
+        )
         self._thread.start()
 
     def stop(self) -> None:
@@ -1292,7 +1301,10 @@ class Hub:
             return
         self._stop.set()
         self.listening.clear()
-        thread.join(timeout=_LISTEN_POLL_SECONDS + 1)  # the listener checks the flag every poll
+        if self._wake is not None:
+            self._wake.close()  # the listener's end now reads EOF, so its wait ends at once
+            self._wake = None
+        thread.join(timeout=self.listen_poll_seconds + 1)  # a listener stuck in a connect sees the flag when it ends
 
     def _install_signal_hook(self, loop: asyncio.AbstractEventLoop) -> None:
         """
@@ -1345,7 +1357,11 @@ class Hub:
             settings["connect_timeout"] = _CONNECT_TIMEOUT_SECONDS
         return make_conninfo(base, **settings)
 
-    def _listen(self, stop: threading.Event) -> None:
+    def _listen(self, stop: threading.Event, wake: socket.socket) -> None:
+        with wake:
+            self._listen_until(stop, wake)
+
+    def _listen_until(self, stop: threading.Event, wake: socket.socket) -> None:
         backoff = _BACKOFF_START_SECONDS
         connected_before = False
         while not stop.is_set():
@@ -1367,13 +1383,19 @@ class Hub:
                     self._post(self._resync)
                     self.listening.set()
                     last_checked = time.monotonic()
-                    while not stop.is_set():
-                        if time.monotonic() - last_checked >= _KEEPALIVE_QUERY_SECONDS:
-                            conn.execute("SELECT 1")
-                            last_checked = time.monotonic()
-                        for notification in conn.notifies(timeout=_LISTEN_POLL_SECONDS):
-                            self._last_notification_at = time.time()
-                            self._post(self._notify, notification.payload)
+                    with selectors.DefaultSelector() as ready:
+                        ready.register(conn.fileno(), selectors.EVENT_READ)
+                        ready.register(wake, selectors.EVENT_READ)
+                        while not stop.is_set():
+                            if time.monotonic() - last_checked >= _KEEPALIVE_QUERY_SECONDS:
+                                conn.execute("SELECT 1")
+                                last_checked = time.monotonic()
+                            # Takes what has arrived, including what a query above received; the wait below only
+                            # sees the socket.
+                            for notification in conn.notifies(timeout=0):
+                                self._last_notification_at = time.time()
+                                self._post(self._notify, notification.payload)
+                            ready.select(self.listen_poll_seconds)
             except Exception:
                 if stop.is_set():  # `stop` already cleared `listening`; a later start may have set it again
                     return
