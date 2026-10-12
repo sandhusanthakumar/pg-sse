@@ -4,6 +4,7 @@ import contextlib
 import dataclasses
 import os
 import signal
+import socket
 import sys
 import threading
 import time
@@ -396,6 +397,25 @@ async def test_lifespan_waits_for_the_listener(db):
         assert hub.stats().listener_connected
 
 
+async def test_leaving_the_lifespan_does_not_wait_for_the_poll(db):
+    hub = make_hub(db, listen_poll_seconds=30)
+    async with hub.lifespan():
+        await asyncio.sleep(0.2)  # the listener is idle in its wait
+        began = time.monotonic()
+    assert time.monotonic() - began < 0.1
+    assert hub._thread is None
+
+
+async def test_a_notification_wakes_the_listener_before_the_poll(db):
+    hub = make_hub(db, listen_poll_seconds=30)
+    woken = []
+    async with hub.lifespan():
+        hub._notify = woken.append  # type: ignore[method-assign]
+        execute(db.dsn, f"SELECT pg_notify('{db.channel}', 'room')")
+        await until(lambda: woken, timeout=2)
+    assert woken == ["room"]
+
+
 async def test_lifespan_does_not_fail_without_a_database():
     hub = Hub("postgresql://nobody@127.0.0.1:1/none?connect_timeout=1", "c", handle_signals=False, listen_timeout=0.2)
     began = time.monotonic()
@@ -548,6 +568,8 @@ async def test_a_dsn_function_that_raises_is_retried_like_a_failed_connect(db, m
         ({"revalidate_failures": 0}, "revalidate_failures"),
         ({"revalidate_timeout": 0}, "revalidate_timeout"),
         ({"revalidate_timeout": float("nan")}, "revalidate_timeout"),
+        ({"listen_poll_seconds": 0}, "listen_poll_seconds"),
+        ({"listen_poll_seconds": float("inf")}, "listen_poll_seconds"),
         ({"revalidate_failures": 2.5}, "revalidate_failures"),
         ({"revalidate_failures": float("nan")}, "revalidate_failures"),
         ({"revalidate_failures": True}, "revalidate_failures"),
@@ -717,7 +739,8 @@ def test_a_listener_told_to_stop_while_failing_returns_quietly(db):
         mock.patch.object(hub_module.psycopg, "connect", side_effect=stop_then_fail),
         mock.patch.object(hub_module.logger, "warning") as warning,
     ):
-        hub._listen(stop)
+        wake, _ = socket.socketpair()
+        hub._listen(stop, wake)
     warning.assert_not_called()
 
 

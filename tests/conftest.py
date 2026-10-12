@@ -22,8 +22,7 @@ def anyio_backend():
 
 @pytest.fixture(autouse=True)
 def fast_listener(monkeypatch):
-    """The listener polls its stop flag and retries on shorter clocks, so every lifespan ends quickly."""
-    monkeypatch.setattr(hub_module, "_LISTEN_POLL_SECONDS", 0.1)
+    """The listener retries on a shorter clock, so a test that breaks its connection sees it come back quickly."""
     monkeypatch.setattr(hub_module, "_BACKOFF_START_SECONDS", 0.05)
 
 
